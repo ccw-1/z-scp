@@ -2,7 +2,7 @@
  * z-scp.c  —  pax-stream file transfer to/from z/OS with EBCDIC/tag handling
  *
  * Usage:
- *   z-scp [-r] [--dry-run] [--verify] <source> <destination>
+ *   z-scp [-r] [--dry-run] [--verify] [--meta] [--meta-file F] <source> <destination>
  *
  * Direction is inferred from the arguments:
  *   upload:   z-scp localfile       user@host:/remote/path
@@ -16,9 +16,11 @@
  * Single-file / recursive upload:
  *   1. Detect file encoding (EBCDIC-1047 / ISO-8859-1 / binary) from content.
  *   2. Build a pax archive in memory:
+ *      - optional 'g' global header with ZOS.extattr / ZOS.useraudit /
+ *        ZOS.auditoraudit if the meta file carries non-default values.
  *      - 'x' extended header with "ZOS.taginfo=<is_text> <ccsid>" per file.
  *      - ustar file header + content (1047 pre-converted to 819; others as-is).
- *   3. Pipe the archive to: ssh user@host "/bin/pax -r -p p -C <destdir>"
+ *   3. Pipe the archive to: ssh user@host "/bin/pax -r -p p"
  *      z/OS SSH AUTOCVT applies a2e[] to stdin bytes; pax_write() pre-applies
  *      e2a[] so the net effect is identity and z/OS pax sees a plain ASCII stream.
  *
@@ -26,13 +28,21 @@
  *   1. Run: ssh user@host "/bin/pax -w -x pax <files>" and read stdout.
  *      z/OS SSH AUTOCVT applies e2a[] to stdout bytes; pipe_read_block() applies
  *      a2e[] to undo it, recovering the original on-disk bytes.
- *   2. Parse the pax archive: ZOS.taginfo xhdr gives the remote CCSID.
+ *   2. Parse the pax archive: ZOS.taginfo xhdr gives the remote CCSID;
+ *      ZOS.extattr / ZOS.useraudit / ZOS.auditoraudit from 'g' headers are
+ *      captured and written to the meta file if --meta / --meta-file is given.
  *   3. Write files locally; convert 1047→819 if the remote tag is 1047.
+ *
+ * Meta file (--meta / --meta-file):
+ *   A JSON sidecar that records z/OS-specific per-file attributes that have no
+ *   portable equivalent: CCSID, tag state, extattr flags, and audit flags.
+ *   Written on download; read on upload to restore the original remote state.
+ *   ZOS.filefmt is parsed but not stored (always "not" for HFS/zFS files).
  *
  * Build:  gcc -std=c11 -Wall -Wextra -O2 -o z-scp z-scp.c
  */
 #ifdef __MVS__
-#error This is meant to be run on a normal posix platform 
+#error This is meant to be run on a normal posix platform
 #endif
 
 #define _POSIX_C_SOURCE 200809L
@@ -450,23 +460,321 @@ static int detect_ccsid(const char *path, int *is_text) {
 }
 
 /* =========================================================================
+ * Meta file — per-file z/OS attribute record
+ *
+ * Written on download, read on upload.  Plain JSON, no external parser needed.
+ * Format (all fields written on download; only non-default extattr/audit
+ * fields are restored on upload):
+ *
+ *   {
+ *     "version": 1,
+ *     "host": "pok56",
+ *     "remote_root": "/u/ccw/proj",
+ *     "local_root":  "proj",
+ *     "files": {
+ *       "src/main.c": {
+ *         "ccsid": 819, "tag": "on", "mode": "0644", "mtime": 1234567890
+ *       },
+ *       "bin/myprog": {
+ *         "ccsid": 65535, "tag": "off", "mode": "0755", "mtime": 1234567890,
+ *         "extattr": "--s-",
+ *         "useraudit": "fff", "auditoraudit": "---"
+ *       }
+ *     }
+ *   }
+ *
+ * ZOS.extattr field positions: [apf][progctl][shareAS][reserved]
+ * Only stored when != "----".
+ * useraudit / auditoraudit only stored when != defaults ("fff" / "---").
+ * ====================================================================== */
+
+/* Per-file metadata record (in-memory) */
+typedef struct {
+    char  rel_path[4096];    /* key: path relative to transfer root */
+    int   ccsid;             /* 819, 1047, 65535(binary), 0(unknown) */
+    int   tag_on;            /* 1 = T=on (ZOS.taginfo present), 0 = T=off */
+    mode_t mode;             /* permission bits */
+    time_t mtime;            /* modification time */
+    char  extattr[5];        /* "----", "--s-", etc.  NUL-terminated */
+    char  useraudit[8];      /* e.g. "fff" */
+    char  auditoraudit[8];   /* e.g. "---" */
+} meta_entry_t;
+
+/* Growable array of meta entries */
+typedef struct {
+    meta_entry_t *entries;
+    size_t        n, cap;
+} meta_db_t;
+
+static void meta_db_init(meta_db_t *db) {
+    db->entries = NULL; db->n = db->cap = 0;
+}
+
+static meta_entry_t *meta_db_add(meta_db_t *db) {
+    if (db->n == db->cap) {
+        db->cap = db->cap ? db->cap * 2 : 64;
+        db->entries = realloc(db->entries, db->cap * sizeof(meta_entry_t));
+    }
+    meta_entry_t *e = &db->entries[db->n++];
+    memset(e, 0, sizeof(*e));
+    strcpy(e->extattr,      "----");
+    strcpy(e->useraudit,    "fff");
+    strcpy(e->auditoraudit, "---");
+    return e;
+}
+
+/* Find entry by relative path; returns NULL if not found. */
+static meta_entry_t *meta_db_find(meta_db_t *db, const char *rel_path) {
+    for (size_t i = 0; i < db->n; i++)
+        if (strcmp(db->entries[i].rel_path, rel_path) == 0)
+            return &db->entries[i];
+    return NULL;
+}
+
+static void meta_db_free(meta_db_t *db) {
+    free(db->entries);
+    db->entries = NULL; db->n = db->cap = 0;
+}
+
+/*
+ * json_escape: write s into buf (size bufsz) with JSON string escaping.
+ * Only needs to handle printable ASCII (all our strings are paths/flags).
+ */
+static void json_escape(const char *s, char *buf, size_t bufsz) {
+    size_t o = 0;
+    for (; *s && o + 4 < bufsz; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\') { buf[o++] = '\\'; buf[o++] = c; }
+        else buf[o++] = c;
+    }
+    buf[o] = '\0';
+}
+
+/*
+ * meta_write: serialise meta_db to a JSON file.
+ * header fields (host, remote_root, local_root) are passed directly.
+ */
+static int meta_write(const char *path, const meta_db_t *db,
+                      const char *host, const char *remote_root,
+                      const char *local_root) {
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        fprintf(stderr, "z-scp: cannot write meta file %s: %s\n",
+                path, strerror(errno));
+        return -1;
+    }
+
+    char esc[4096];
+    fprintf(f, "{\n");
+    fprintf(f, "  \"version\": 1,\n");
+    json_escape(host,        esc, sizeof(esc)); fprintf(f, "  \"host\": \"%s\",\n", esc);
+    json_escape(remote_root, esc, sizeof(esc)); fprintf(f, "  \"remote_root\": \"%s\",\n", esc);
+    json_escape(local_root,  esc, sizeof(esc)); fprintf(f, "  \"local_root\": \"%s\",\n", esc);
+    fprintf(f, "  \"files\": {\n");
+
+    for (size_t i = 0; i < db->n; i++) {
+        const meta_entry_t *e = &db->entries[i];
+        json_escape(e->rel_path, esc, sizeof(esc));
+        fprintf(f, "    \"%s\": {\n", esc);
+        fprintf(f, "      \"ccsid\": %d,\n", e->ccsid);
+        fprintf(f, "      \"tag\": \"%s\",\n", e->tag_on ? "on" : "off");
+        fprintf(f, "      \"mode\": \"%04o\",\n", (unsigned)(e->mode & 07777));
+        fprintf(f, "      \"mtime\": %lld", (long long)e->mtime);
+        /* optional fields — only emit when non-default */
+        if (strcmp(e->extattr, "----") != 0)
+            fprintf(f, ",\n      \"extattr\": \"%s\"", e->extattr);
+        if (strcmp(e->useraudit, "fff") != 0)
+            fprintf(f, ",\n      \"useraudit\": \"%s\"", e->useraudit);
+        if (strcmp(e->auditoraudit, "---") != 0)
+            fprintf(f, ",\n      \"auditoraudit\": \"%s\"", e->auditoraudit);
+        fprintf(f, "\n    }%s\n", (i + 1 < db->n) ? "," : "");
+    }
+
+    fprintf(f, "  }\n}\n");
+    fclose(f);
+    return 0;
+}
+
+/*
+ * json_str_val: locate "key": "VALUE" in buf and copy VALUE into out (outsz).
+ * Returns 1 on success, 0 if not found.
+ */
+static int json_str_val(const char *buf, const char *key,
+                        char *out, size_t outsz) {
+    char needle[256];
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char *p = strstr(buf, needle);
+    if (!p) return 0;
+    p += strlen(needle);
+    while (*p == ' ' || *p == ':' || *p == '\t') p++;
+    if (*p != '"') return 0;
+    p++;
+    size_t o = 0;
+    while (*p && *p != '"' && o + 1 < outsz) {
+        if (*p == '\\') p++;   /* skip escape prefix */
+        out[o++] = *p++;
+    }
+    out[o] = '\0';
+    return 1;
+}
+
+/*
+ * json_int_val: locate "key": NUMBER in buf and return the integer.
+ * Returns def if not found.
+ */
+static long long json_int_val(const char *buf, const char *key, long long def) {
+    char needle[256];
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char *p = strstr(buf, needle);
+    if (!p) return def;
+    p += strlen(needle);
+    while (*p == ' ' || *p == ':' || *p == '\t') p++;
+    if (*p == '-' || (*p >= '0' && *p <= '9')) return strtoll(p, NULL, 10);
+    return def;
+}
+
+/*
+ * meta_read: parse a JSON meta file into db.
+ * We do not depend on a full JSON parser — the file is our own output so the
+ * structure is predictable.  We scan for "rel_path": { ... } blocks.
+ */
+static int meta_read(const char *path, meta_db_t *db) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;   /* non-fatal: caller falls back to auto-detect */
+
+    fseek(f, 0, SEEK_END);
+    long fsz = ftell(f);
+    rewind(f);
+    if (fsz <= 0 || fsz > 16 * 1024 * 1024) { fclose(f); return -1; }
+
+    char *buf = malloc(fsz + 1);
+    if (!buf) { fclose(f); return -1; }
+    if (fread(buf, 1, fsz, f) != (size_t)fsz) { free(buf); fclose(f); return -1; }
+    fclose(f);
+    buf[fsz] = '\0';
+
+    /* Locate the "files" object */
+    const char *files_start = strstr(buf, "\"files\"");
+    if (!files_start) { free(buf); return 0; }
+    const char *obj = strchr(files_start, '{');
+    if (!obj) { free(buf); return 0; }
+    obj++; /* skip '{' */
+
+    /*
+     * Scan entries of the form:
+     *   "rel/path": { "ccsid": N, "tag": "on|off", "mode": "OOOO",
+     *                 "mtime": T [, "extattr": "XXXX"]
+     *                 [, "useraudit": "..."] [, "auditoraudit": "..."] }
+     *
+     * We walk character by character, finding the opening '"' of each key,
+     * then locate the matching value object '{' ... '}'.
+     */
+    const char *p = obj;
+    while (*p) {
+        /* skip whitespace and commas */
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',') p++;
+        if (*p == '}' || *p == '\0') break;   /* end of "files" object */
+        if (*p != '"') { p++; continue; }
+
+        /* read the key (rel_path) */
+        p++;
+        char rel_path[4096] = {0};
+        size_t rlen = 0;
+        while (*p && *p != '"' && rlen + 1 < sizeof(rel_path)) {
+            if (*p == '\\') p++;
+            rel_path[rlen++] = *p++;
+        }
+        rel_path[rlen] = '\0';
+        if (*p == '"') p++;
+
+        /* skip to ':' then '{' */
+        while (*p && *p != ':') p++;
+        if (*p == ':') p++;
+        while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+        if (*p != '{') continue;
+
+        /* find matching '}' — one level deep */
+        const char *obj_start = p + 1;
+        int depth = 1;
+        const char *q = p + 1;
+        while (*q && depth > 0) {
+            if (*q == '{') depth++;
+            else if (*q == '}') depth--;
+            q++;
+        }
+        /* q now points just past the closing '}' */
+        size_t obj_len = (size_t)(q - obj_start - 1);
+        char *entry_buf = malloc(obj_len + 1);
+        if (!entry_buf) { p = q; continue; }
+        memcpy(entry_buf, obj_start, obj_len);
+        entry_buf[obj_len] = '\0';
+
+        meta_entry_t *e = meta_db_add(db);
+        snprintf(e->rel_path, sizeof(e->rel_path), "%s", rel_path);
+
+        e->ccsid   = (int)json_int_val(entry_buf, "ccsid",  0);
+        e->mtime   = (time_t)json_int_val(entry_buf, "mtime", 0);
+
+        char tmp[64];
+        if (json_str_val(entry_buf, "tag",  tmp, sizeof(tmp)))
+            e->tag_on = (strcmp(tmp, "on") == 0) ? 1 : 0;
+        if (json_str_val(entry_buf, "mode", tmp, sizeof(tmp)))
+            e->mode = (mode_t)strtol(tmp, NULL, 8);
+        /* copy short fixed-width fields; clamp to buffer without GCC truncation warning */
+        if (json_str_val(entry_buf, "extattr", tmp, sizeof(tmp))) {
+            size_t n = strlen(tmp); if (n >= sizeof(e->extattr)) n = sizeof(e->extattr)-1;
+            memcpy(e->extattr, tmp, n); e->extattr[n] = '\0';
+        }
+        if (json_str_val(entry_buf, "useraudit", tmp, sizeof(tmp))) {
+            size_t n = strlen(tmp); if (n >= sizeof(e->useraudit)) n = sizeof(e->useraudit)-1;
+            memcpy(e->useraudit, tmp, n); e->useraudit[n] = '\0';
+        }
+        if (json_str_val(entry_buf, "auditoraudit", tmp, sizeof(tmp))) {
+            size_t n = strlen(tmp); if (n >= sizeof(e->auditoraudit)) n = sizeof(e->auditoraudit)-1;
+            memcpy(e->auditoraudit, tmp, n); e->auditoraudit[n] = '\0';
+        }
+
+        free(entry_buf);
+        p = q;
+    }
+
+    free(buf);
+    return 0;
+}
+
+/*
+ * meta_default_path: build the default meta file path.
+ * For a directory transfer, it lives inside the local root as .z-scp-meta.json.
+ * For a single-file transfer, it lives in the same directory as the local file.
+ */
+static void meta_default_path(char *out, size_t outsz,
+                               const char *local, int is_dir) {
+    if (is_dir) {
+        snprintf(out, outsz, "%s/.z-scp-meta.json", local);
+    } else {
+        /* place alongside the file */
+        const char *slash = strrchr(local, '/');
+        if (slash) {
+            size_t dlen = (size_t)(slash - local);
+            if (dlen >= outsz - 18) dlen = outsz - 18;  /* clamp */
+            memcpy(out, local, dlen);
+            memcpy(out + dlen, "/.z-scp-meta.json", 18);
+        } else {
+            snprintf(out, outsz, ".z-scp-meta.json");
+        }
+    }
+}
+
+/* =========================================================================
  * PAX archive writer
  * ====================================================================== */
 
 /*
  * pax_write: write n bytes to fd, converting each byte with e2a[] for
  * PAX_EBCDIC uploads to z/OS.
- *
- * z/OS SSH stdin has _BPXK_AUTOCVT=ON which applies a2e[] to every byte
- * that a child process reads.  To deliver ASCII byte B to z/OS pax -r, we
- * must send e2a[B] so that AUTOCVT's a2e[e2a[B]] = B.
- *
- * This is exactly what aepipe -e2a does: convert ASCII archive to EBCDIC,
- * then AUTOCVT converts back to ASCII → z/OS pax sees a plain ASCII archive.
  */
 static ssize_t pax_write(int fd, const void *buf, size_t n, pax_enc_t enc) {
     if (enc == PAX_ASCII) return write(fd, buf, n);
-    /* PAX_EBCDIC: apply e2a[] to each ASCII byte so AUTOCVT restores it */
     unsigned char tmp[8192];
     const unsigned char *src = (const unsigned char *)buf;
     size_t done = 0;
@@ -493,14 +801,9 @@ static int write_zeros(int fd, size_t n) {
 
 /*
  * set_checksum: fill the ustar checksum field.
- *
- * Standard ustar checksum: sum over ASCII header bytes with ASCII space
- * (0x20) fill in the checksum field.  This is what z/OS pax -r verifies
- * after AUTOCVT restores the ASCII bytes (e2a[] on our side, a2e[] by
- * AUTOCVT → identity).
  */
 static void set_checksum(unsigned char hdr[512], pax_enc_t enc) {
-    (void)enc;  /* same computation for both: z/OS sees ASCII after AUTOCVT */
+    (void)enc;
     memset(hdr + 148, ' ', 8);
     unsigned sum = 0;
     for (int i = 0; i < 512; i++) sum += hdr[i];
@@ -509,21 +812,87 @@ static void set_checksum(unsigned char hdr[512], pax_enc_t enc) {
 }
 
 /*
- * write_pax_xhdr: write a PAX 'x' extended header record carrying ZOS.taginfo.
+ * write_pax_ghdr: write a PAX 'g' global extended header carrying z/OS
+ * per-file attributes that pax -r restores natively.
  *
- * z/OS pax -r reads ZOS.taginfo natively and sets the file tag on extraction —
- * no separate chtag pass needed.  Format matches what z/OS pax -w emits:
- *   text (ccsid 819):   "21 ZOS.taginfo=1 819\n"
- *   binary (ccsid 0):   "23 ZOS.taginfo=0 65535\n"
+ * Only written when at least one attribute is non-default:
+ *   ZOS.extattr != "----"
+ *   ZOS.useraudit != "fff"  (default = no auditing)
+ *   ZOS.auditoraudit != "---"
+ *
+ * z/OS pax -r applies 'g' header values to the immediately following file
+ * entry, which is exactly what we want (one 'g' per file that needs it).
  */
-static int write_pax_xhdr(int fd, const char *basename, int ccsid,
-                           pax_enc_t enc) {
-    /* Build "LENGTH ZOS.taginfo=FLAG CCSID\n" — self-consistent length */
+static int write_pax_ghdr(int fd, const meta_entry_t *e, pax_enc_t enc) {
+    char xdata[512];
+    int  xlen = 0;
+
+    /* ZOS.taginfo default in 'g' — always include to match z/OS pax -w output */
+    /* (z/OS pax -r ignores the global ZOS.taginfo; the per-file 'x' overrides) */
+    char tmp[128];
+    /* extattr */
+    if (strcmp(e->extattr, "----") != 0) {
+        int n;
+        for (int reclen = 1; reclen <= 99; reclen++) {
+            n = snprintf(tmp, sizeof(tmp), "%d ZOS.extattr=%s\n",
+                         reclen, e->extattr);
+            if (n == reclen) break;
+        }
+        xlen += snprintf(xdata + xlen, sizeof(xdata) - xlen, "%s", tmp);
+    }
+    /* useraudit */
+    if (strcmp(e->useraudit, "fff") != 0) {
+        int n;
+        for (int reclen = 1; reclen <= 99; reclen++) {
+            n = snprintf(tmp, sizeof(tmp), "%d ZOS.useraudit=%s\n",
+                         reclen, e->useraudit);
+            if (n == reclen) break;
+        }
+        xlen += snprintf(xdata + xlen, sizeof(xdata) - xlen, "%s", tmp);
+    }
+    /* auditoraudit */
+    if (strcmp(e->auditoraudit, "---") != 0) {
+        int n;
+        for (int reclen = 1; reclen <= 99; reclen++) {
+            n = snprintf(tmp, sizeof(tmp), "%d ZOS.auditoraudit=%s\n",
+                         reclen, e->auditoraudit);
+            if (n == reclen) break;
+        }
+        xlen += snprintf(xdata + xlen, sizeof(xdata) - xlen, "%s", tmp);
+    }
+
+    if (xlen == 0) return 0;   /* nothing to emit */
+
+    unsigned char hdr[512];
+    memset(hdr, 0, 512);
+    snprintf((char *)hdr,       100, "GlobalHead.%d.1", (int)getpid());
+    snprintf((char *)hdr + 100,   8, "%07o", 0600);
+    snprintf((char *)hdr + 108,   8, "%07o", 0);
+    snprintf((char *)hdr + 116,   8, "%07o", 0);
+    snprintf((char *)hdr + 124,  12, "%011o", xlen);
+    snprintf((char *)hdr + 136,  12, "%011llo", (unsigned long long)e->mtime);
+    hdr[156] = 'g';
+    memcpy(hdr + 257, "ustar\0" "00", 8);
+    set_checksum(hdr, enc);
+    if (pax_write(fd, hdr, 512, enc) != 512) return -1;
+    if (pax_write(fd, xdata, xlen, enc) != xlen) return -1;
+    size_t pad = (512 - (xlen % 512)) % 512;
+    if (pad && write_zeros(fd, pad) != 0) return -1;
+    return 0;
+}
+
+/*
+ * write_pax_xhdr: write a PAX 'x' per-file extended header with ZOS.taginfo.
+ * Also writes ZOS.taginfo=0 (T=off) when tag_on==0 so pax -r sets T=off.
+ */
+static int write_pax_xhdr(int fd, const char *basename,
+                           int ccsid, int tag_on,
+                           pax_enc_t enc, mode_t mode, time_t mtime) {
     char xdata[128];
     int  xlen = 0;
     char tmp[64];
-    int flag = (ccsid == 65535) ? 0 : 1;
-    int out_ccsid = (ccsid == 65535) ? 65535 : ccsid;
+    int flag = tag_on ? 1 : 0;
+    int out_ccsid = (ccsid == 65535) ? 65535 : (ccsid ? ccsid : 65535);
     int reclen;
     for (reclen = 1; reclen <= 99; reclen++) {
         int n = snprintf(tmp, sizeof(tmp), "%d ZOS.taginfo=%d %d\n",
@@ -532,50 +901,44 @@ static int write_pax_xhdr(int fd, const char *basename, int ccsid,
     }
     xlen += snprintf(xdata + xlen, sizeof(xdata) - xlen, "%s", tmp);
 
-    /* Build the 'x' ustar header */
     unsigned char hdr[512];
     memset(hdr, 0, 512);
-
-    /* name: "PaxHeader/<basename>" */
     snprintf((char *)hdr, 100, "PaxHeader/%.88s", basename);
-    /* mode */
-    snprintf((char *)hdr + 100, 8, "%07o", 0644);
-    /* uid, gid */
+    snprintf((char *)hdr + 100, 8, "%07o", (unsigned)(mode & 07777));
     snprintf((char *)hdr + 108, 8, "%07o", 0);
     snprintf((char *)hdr + 116, 8, "%07o", 0);
-    /* size of extended data */
     snprintf((char *)hdr + 124, 12, "%011o", xlen);
-    /* mtime */
-    snprintf((char *)hdr + 136, 12, "%011o", 0);
-    /* type: 'x' = PAX extended header */
+    snprintf((char *)hdr + 136, 12, "%011llo", (unsigned long long)mtime);
     hdr[156] = 'x';
-    /* ustar magic */
     memcpy(hdr + 257, "ustar\0" "00", 8);
-
     set_checksum(hdr, enc);
     if (pax_write(fd, hdr, 512, enc) != 512) return -1;
     if (pax_write(fd, xdata, xlen, enc) != xlen) return -1;
     size_t pad = (512 - (xlen % 512)) % 512;
     if (pad && write_zeros(fd, pad) != 0) return -1;
-
     return 0;
 }
 
 /*
  * write_pax_file: write the ustar file header + content to fd.
- * If ccsid==1047, convert EBCDIC→819 on the fly.
+ *
+ * ccsid controls content encoding:
+ *   1047 → local file is ASCII (was converted on download); convert ASCII→EBCDIC
+ *           so z/OS stores EBCDIC bytes under the 1047 tag.
+ *   819 / 65535 → pass through as-is.
  */
 static int write_pax_file(int fd, const char *path, const char *arcname,
-                          int ccsid, off_t filesize, pax_enc_t enc) {
+                          int ccsid, off_t filesize, pax_enc_t enc,
+                          mode_t mode, time_t mtime) {
     unsigned char hdr[512];
     memset(hdr, 0, 512);
 
     snprintf((char *)hdr, 100, "%.99s", arcname);
-    snprintf((char *)hdr + 100,    8, "%07o", 0644);
+    snprintf((char *)hdr + 100,    8, "%07o", (unsigned)(mode & 07777));
     snprintf((char *)hdr + 108,    8, "%07o", 0);
     snprintf((char *)hdr + 116,    8, "%07o", 0);
     snprintf((char *)hdr + 124,   12, "%011llo", (unsigned long long)filesize);
-    snprintf((char *)hdr + 136,   12, "%011o", 0);
+    snprintf((char *)hdr + 136,   12, "%011llo", (unsigned long long)mtime);
     hdr[156] = '0'; /* regular file */
     memcpy(hdr + 257, "ustar\0" "00", 8);
     set_checksum(hdr, enc);
@@ -584,24 +947,6 @@ static int write_pax_file(int fd, const char *path, const char *arcname,
     int src = open(path, O_RDONLY);
     if (src < 0) { fprintf(stderr, "z-scp: open %s: %s\n", path, strerror(errno)); return -1; }
 
-    /*
-     * File content encoding:
-     *
-     * PAX_EBCDIC (z/OS): pax_write applies e2a[] to each byte, so AUTOCVT
-     * (a2e[]) on z/OS restores the original byte.  We want z/OS to store
-     * ISO-8859-1 (819) bytes, so we feed 819 bytes into pax_write:
-     *   For 819 source:  feed ibuf[i] as-is → pax_write sends e2a[819_byte]
-     *                    → AUTOCVT restores 819_byte on z/OS ✓
-     *   For 1047 source: convert EBCDIC→819 first (e2a[]), then pax_write
-     *                    sends e2a[e2a[1047_byte]] — BUT e2a(e2a(x)) ≠ x.
-     *                    Instead: ibuf[i] is EBCDIC 1047; e2a[ibuf[i]] IS
-     *                    the 819 byte; pax_write then sends e2a[that].
-     *                    Wait — pax_write ALREADY applies e2a[].  So for
-     *                    1047 source we must pass ibuf[i] (EBCDIC) to
-     *                    pax_write and rely on e2a[] being the right map. ✓
-     *
-     * PAX_ASCII (non-z/OS): send 819 bytes as-is, or convert 1047→819.
-     */
     unsigned char ibuf[8192];
     unsigned char obuf[8192];
     ssize_t nr;
@@ -609,21 +954,28 @@ static int write_pax_file(int fd, const char *path, const char *arcname,
     while ((nr = read(src, ibuf, sizeof(ibuf))) > 0) {
         if (enc == PAX_EBCDIC) {
             /*
-             * pax_write applies e2a[] to every byte; AUTOCVT on z/OS stdin
-             * applies a2e[], so the net result is identity: a2e[e2a[x]] = x.
-             * We feed pax_write the bytes we want z/OS to store:
-             *   819 source:    feed as-is  → z/OS stores original 819 bytes ✓
-             *   1047 source:   pre-convert 1047→819 via e2a[], feed result ✓
-             *   binary (65535): feed as-is → z/OS stores original bytes ✓
+             * pax_write applies e2a[]; AUTOCVT on z/OS stdin applies a2e[].
+             * Net: a2e[e2a[x]] = x — identity.
+             * We feed pax_write the bytes we want z/OS to store on disk.
+             *
+             * ccsid==1047: z/OS stores EBCDIC.  Local file holds ASCII (we
+             *   converted on download).  Convert ASCII→EBCDIC via a2e[] first,
+             *   then pax_write sends e2a[a2e[ascii]] = ascii byte... wait:
+             *   we want z/OS to store EBCDIC, so we must give pax_write the
+             *   EBCDIC byte.  AUTOCVT will then do a2e[e2a[ebcdic]] = ebcdic. ✓
+             *   So: obuf[i] = a2e[ibuf[i]]  (ASCII→EBCDIC), then pax_write
+             *   applies e2a[] → sends e2a[a2e[ascii]].  AUTOCVT does
+             *   a2e[e2a[a2e[ascii]]] = a2e[ascii] = ebcdic. ✓
+             * ccsid==819 or binary: feed as-is → z/OS stores original bytes. ✓
              */
             if (ccsid == 1047)
-                for (ssize_t i = 0; i < nr; i++) obuf[i] = e2a[ibuf[i]];
+                for (ssize_t i = 0; i < nr; i++) obuf[i] = a2e[ibuf[i]];
             else
-                memcpy(obuf, ibuf, nr); /* 819 and binary: pass through */
+                memcpy(obuf, ibuf, nr);
         } else {
-            /* PAX_ASCII */
+            /* PAX_ASCII (non-z/OS target) */
             if (ccsid == 1047)
-                for (ssize_t i = 0; i < nr; i++) obuf[i] = e2a[ibuf[i]];
+                for (ssize_t i = 0; i < nr; i++) obuf[i] = a2e[ibuf[i]];
             else
                 memcpy(obuf, ibuf, nr);
         }
@@ -632,7 +984,6 @@ static int write_pax_file(int fd, const char *path, const char *arcname,
     }
     close(src);
 
-    /* pad content to 512-byte boundary (zeros same in both encodings) */
     size_t pad = (512 - (written % 512)) % 512;
     if (pad && write_zeros(fd, pad) != 0) return -1;
 
@@ -643,39 +994,21 @@ static int write_pax_file(int fd, const char *path, const char *arcname,
  * Global flags (set by argument parser, read by transfer functions)
  * ====================================================================== */
 
-static int dry_run     = 0;
-static int reprobe     = 0;  /* kept for future cache reprobe use */
-static int do_verify   = 0;  /* --verify: dump first 32 remote bytes via /bin/od */
-static int recursive   = 0;  /* -r: recurse into directories */
-static int force_ccsid = 0;  /* --ccsid N: override/fallback CCSID for downloads */
-static int smart       = 0;  /* --smart: auto-detect encoding for untagged files */
+static int dry_run      = 0;
+static int reprobe      = 0;
+static int do_verify    = 0;
+static int recursive    = 0;
+static int force_ccsid  = 0;
+static int smart        = 0;
+static int use_meta     = 0;   /* --meta or --meta-file specified */
+static char meta_path[4096];   /* resolved meta file path */
 
 /* =========================================================================
  * PAX archive reader (for download)
- *
- * z/OS pax -w writes ASCII pax archive bytes to its stdout.  SSH AUTOCVT
- * applies e2a[] to each byte before sending (EBCDIC programs output EBCDIC
- * which AUTOCVT converts to ASCII for the network).  However z/OS pax -w
- * writes raw bytes that AUTOCVT treats as EBCDIC → we receive e2a[byte].
- * To recover original pax archive bytes: apply a2e[received].
- *
- * After a2e[] decoding:
- *   - Header fields are plain ASCII/octal.
- *   - xdata ('g'/'x' records) is plain ASCII text.
- *   - File content bytes are the z/OS on-disk bytes in the file's tagged CCSID.
- *
- * The z/OS per-file extended header ('x') carries ZOS.taginfo=1 <ccsid>
- * for tagged files (or ZOS.taginfo=0 for untagged).  We use this to
- * determine whether to convert content bytes from 1047→819.
  * ====================================================================== */
 
 #define PAX_BLOCK 512
 
-/*
- * pipe_read_block: read exactly PAX_BLOCK bytes from pipe, applying a2e[]
- * to each byte (reverses z/OS AUTOCVT's e2a[] on stdout).
- * Returns 0 on success, -1 on EOF/error.
- */
 static int pipe_read_block(FILE *pipe, unsigned char buf[PAX_BLOCK]) {
     for (int i = 0; i < PAX_BLOCK; i++) {
         int c = fgetc(pipe);
@@ -685,11 +1018,6 @@ static int pipe_read_block(FILE *pipe, unsigned char buf[PAX_BLOCK]) {
     return 0;
 }
 
-/*
- * pipe_read_block_raw: read exactly PAX_BLOCK bytes from pipe applying a2e[]
- * but WITHOUT additional content conversion.  Used for all blocks — the a2e[]
- * step is always needed to undo AUTOCVT; content conversion happens separately.
- */
 static int pipe_read_block_raw(FILE *pipe, unsigned char buf[PAX_BLOCK]) {
     return pipe_read_block(pipe, buf);
 }
@@ -705,30 +1033,83 @@ static long long parse_octal(const char *s, int len) {
 }
 
 /*
- * Parse extended header data to extract CCSID.
- * Recognises both "IBM.codepage=N" (upload path) and "ZOS.taginfo=1 N" (z/OS pax -w).
- * Returns 0 if not found.
+ * xhdr_state_t: accumulates ZOS.* values from 'g' and 'x' headers for one
+ * file entry.  Cleared after each regular file ('0') is processed.
+ * 'g' values are overridden by 'x' values when both are present.
  */
-static int parse_xhdr_ccsid(const char *data, size_t len) {
+typedef struct {
+    int  ccsid;            /* from ZOS.taginfo in 'x' (0 = absent / T=off) */
+    int  tag_on;           /* 1 if ZOS.taginfo=1 seen in 'x' */
+    char extattr[5];       /* from ZOS.extattr in 'g' */
+    char useraudit[8];     /* from ZOS.useraudit in 'g' */
+    char auditoraudit[8];  /* from ZOS.auditoraudit in 'g' */
+} xhdr_state_t;
+
+static void xhdr_state_reset(xhdr_state_t *s) {
+    s->ccsid = 0; s->tag_on = 0;
+    strcpy(s->extattr,      "----");
+    strcpy(s->useraudit,    "fff");
+    strcpy(s->auditoraudit, "---");
+}
+
+/*
+ * parse_xhdr_fields: scan all "LENGTH KEY=VALUE\n" records in data[0..len].
+ * Recognises ZOS.taginfo, ZOS.extattr, ZOS.useraudit, ZOS.auditoraudit,
+ * and IBM.codepage.  Fills the appropriate fields in *s.
+ * is_global: if 1, this is a 'g' header (fills extattr/audit but not ccsid).
+ *            if 0, this is an 'x' header (fills ccsid/tag_on).
+ */
+static void parse_xhdr_fields(const char *data, size_t len,
+                               xhdr_state_t *s, int is_global) {
     size_t i = 0;
     while (i < len) {
         size_t j = i;
         while (j < len && data[j] != '\n') j++;
-        /* find key after "NNN " */
+        /* find key: skip leading digits and space */
         size_t k = i;
         while (k < j && data[k] != ' ') k++;
-        k++;
-        if (strncmp(data + k, "IBM.codepage=", 13) == 0)
-            return atoi(data + k + 13);
-        /* ZOS.taginfo=0 (untagged) or ZOS.taginfo=1 <ccsid> */
-        if (strncmp(data + k, "ZOS.taginfo=", 12) == 0) {
-            const char *p = data + k + 12;
-            if (*p == '0') { i = j + 1; continue; } /* untagged */
-            if (*p == '1' && *(p+1) == ' ') return atoi(p + 2);
+        k++;   /* skip space */
+        if (k >= j) { i = j + 1; continue; }
+        const char *kp = data + k;
+        size_t krem = j - k;
+
+        if (!is_global) {
+            /* per-file 'x' header */
+            if (krem > 12 && strncmp(kp, "ZOS.taginfo=", 12) == 0) {
+                const char *v = kp + 12;
+                if (*v == '0') {
+                    s->tag_on = 0; s->ccsid = 0;
+                } else if (*v == '1' && *(v+1) == ' ') {
+                    s->tag_on = 1; s->ccsid = atoi(v + 2);
+                }
+            } else if (krem > 13 && strncmp(kp, "IBM.codepage=", 13) == 0) {
+                s->ccsid  = atoi(kp + 13);
+                s->tag_on = (s->ccsid != 0 && s->ccsid != 65535) ? 1 : 0;
+            }
+        } else {
+            /* global 'g' header */
+            if (krem > 12 && strncmp(kp, "ZOS.extattr=", 12) == 0) {
+                size_t vlen = j - (k + 12);
+                if (vlen >= 4) {
+                    memcpy(s->extattr, kp + 12, 4);
+                    s->extattr[4] = '\0';
+                }
+            } else if (krem > 14 && strncmp(kp, "ZOS.useraudit=", 14) == 0) {
+                size_t vlen = j - (k + 14);
+                if (vlen > 0 && vlen < sizeof(s->useraudit)) {
+                    memcpy(s->useraudit, kp + 14, vlen);
+                    s->useraudit[vlen] = '\0';
+                }
+            } else if (krem > 18 && strncmp(kp, "ZOS.auditoraudit=", 17) == 0) {
+                size_t vlen = j - (k + 17);
+                if (vlen > 0 && vlen < sizeof(s->auditoraudit)) {
+                    memcpy(s->auditoraudit, kp + 17, vlen);
+                    s->auditoraudit[vlen] = '\0';
+                }
+            }
         }
         i = j + 1;
     }
-    return 0;
 }
 
 /*
@@ -748,16 +1129,13 @@ static void makedirs(const char *path) {
 }
 
 /*
- * smart_convert: if --smart is set and ccsid==0 (no ZOS.taginfo from stream),
- * detect encoding of the already-written file and rewrite it converted if 1047.
- * Called after the raw bytes have been written to out_path.
+ * smart_convert: if --smart is set and ccsid==0, auto-detect and convert.
  */
 static void smart_convert(const char *out_path) {
     int is_text = 0;
     int detected = detect_ccsid(out_path, &is_text);
-    if (detected != 1047) return; /* 819/binary/ambiguous — leave as-is */
+    if (detected != 1047) return;
 
-    /* rewrite: read all, apply e2a[], write back */
     FILE *f = fopen(out_path, "rb");
     if (!f) return;
     fseek(f, 0, SEEK_END);
@@ -777,13 +1155,17 @@ static void smart_convert(const char *out_path) {
 
 /*
  * pax_extract_entry: read and extract one file entry from the download stream.
- * pipe_read_block has already applied a2e[], giving on-disk bytes.
- * ccsid: from ZOS.taginfo or IBM.codepage (1047 = convert EBCDIC→819, others pass-through).
- * sz: file size in bytes.
+ * Returns 0 on success, -1 on error (stream is always fully drained).
+ * If meta_db is non-NULL, appends an entry for this file.
+ * rel_path: path relative to the download root (used as the meta key).
+ * ustar_mode / ustar_mtime: from the file's ustar header.
  */
 static int pax_extract_entry(FILE *pipe, const char *out_path,
-                              long long sz, int ccsid) {
-    /* ensure parent directory exists */
+                              long long sz, const xhdr_state_t *xs,
+                              meta_db_t *meta_db, const char *rel_path,
+                              mode_t ustar_mode, time_t ustar_mtime) {
+    int effective_ccsid = force_ccsid ? force_ccsid : xs->ccsid;
+
     char parent[4096];
     snprintf(parent, sizeof(parent), "%s", out_path);
     char *slash = strrchr(parent, '/');
@@ -792,26 +1174,20 @@ static int pax_extract_entry(FILE *pipe, const char *out_path,
     int out = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (out < 0) {
         fprintf(stderr, "z-scp: open %s: %s\n", out_path, strerror(errno));
-        /* drain blocks so stream stays in sync */
         long long skip = (sz + PAX_BLOCK - 1) / PAX_BLOCK;
         unsigned char tmp[PAX_BLOCK];
         for (long long b = 0; b < skip; b++) pipe_read_block_raw(pipe, tmp);
         return -1;
     }
 
-    /*
-     * pipe_read_block applies a2e[] to undo AUTOCVT's e2a[] on z/OS stdout,
-     * recovering the on-disk bytes.
-     * For 819/binary files: on-disk bytes are already 819 → write as-is.
-     * For 1047-tagged files: on-disk bytes are EBCDIC-1047 → apply e2a[] → 819.
-     */
     long long remaining = sz;
     unsigned char block[PAX_BLOCK];
     while (remaining > 0) {
         if (pipe_read_block(pipe, block) != 0) { close(out); return -1; }
         long long take = remaining < PAX_BLOCK ? remaining : PAX_BLOCK;
         unsigned char outbuf[PAX_BLOCK];
-        if (ccsid == 1047) {
+        if (effective_ccsid == 1047) {
+            /* z/OS stored EBCDIC; convert to ASCII for local use */
             for (long long i = 0; i < take; i++) outbuf[i] = e2a[block[i]];
         } else {
             memcpy(outbuf, block, take);
@@ -820,45 +1196,59 @@ static int pax_extract_entry(FILE *pipe, const char *out_path,
         remaining -= take;
     }
     close(out);
-    fprintf(stderr, "z-scp: extracted %s (ccsid=%d)\n", out_path, ccsid ? ccsid : 65535);
-    /* --smart: auto-detect and convert untagged files (no ZOS.taginfo) */
-    if (smart && ccsid == 0)
+
+    fprintf(stderr, "z-scp: extracted %s (ccsid=%d tag=%s)\n",
+            out_path, effective_ccsid ? effective_ccsid : 65535,
+            xs->tag_on ? "on" : "off");
+
+    if (smart && xs->ccsid == 0 && !force_ccsid)
         smart_convert(out_path);
+
+    /* record metadata */
+    if (meta_db && rel_path) {
+        meta_entry_t *me = meta_db_add(meta_db);
+        snprintf(me->rel_path, sizeof(me->rel_path), "%s", rel_path);
+        me->ccsid  = effective_ccsid ? effective_ccsid : xs->ccsid;
+        me->tag_on = xs->tag_on;
+        me->mode   = ustar_mode ? ustar_mode : 0644;
+        me->mtime  = ustar_mtime;
+        snprintf(me->extattr,      sizeof(me->extattr),      "%s", xs->extattr);
+        snprintf(me->useraudit,    sizeof(me->useraudit),    "%s", xs->useraudit);
+        snprintf(me->auditoraudit, sizeof(me->auditoraudit), "%s", xs->auditoraudit);
+    }
+
     return 0;
 }
 
 /*
  * read_pax_stream: read a pax archive stream from z/OS, extracting files.
- * pipe_read_block handles the AUTOCVT decode (a2e[]) automatically.
  *
- * If dest_path is non-NULL: single-file mode — write the first regular file
- * to dest_path (used by do_download).
- *
- * If dest_path is NULL: tree mode — reconstruct full paths from archive
- * names under root_dir (used by download_dir).  archive names from z/OS
- * pax -w are absolute paths like "/u/user/dir/file"; we strip a leading
- * slash and prepend root_dir.
+ * dest_path non-NULL → single-file mode (write first regular file to dest_path).
+ * dest_path NULL     → tree mode (strip leading slash, prepend root_dir).
+ * remote_root        → used to compute relative paths for meta keys.
+ * meta_db            → if non-NULL, populate with per-file attributes.
  */
 static int read_pax_stream(FILE *pipe, const char *dest_path,
-                            const char *root_dir) {
+                           const char *root_dir, const char *remote_root,
+                           meta_db_t *meta_db) {
     unsigned char block[PAX_BLOCK];
-    /* force_ccsid overrides ZOS.taginfo when set (for T=off files) */
-    int ccsid  = 0;  /* from ZOS.taginfo in last 'x' xhdr, or force_ccsid */
+    xhdr_state_t xs;
+    xhdr_state_reset(&xs);
     int nfiles = 0;
 
     while (1) {
         if (pipe_read_block(pipe, block) != 0) break;
 
-        /* end-of-archive: all-zero block */
         int allzero = 1;
         for (int i = 0; i < PAX_BLOCK; i++) if (block[i]) { allzero = 0; break; }
         if (allzero) break;
 
         char     type = (char)block[156];
         long long sz  = parse_octal((char *)block + 124, 12);
+        mode_t   umode = (mode_t)parse_octal((char *)block + 100, 8);
+        time_t   umtime = (time_t)parse_octal((char *)block + 136, 12);
 
         if (type == 'g' || type == 'G' || type == 'x' || type == 'X') {
-            /* PAX global ('g') or per-file ('x') extended header */
             long long xsz = sz;
             char *xdata = malloc(xsz + 1);
             if (!xdata) return -1;
@@ -871,44 +1261,55 @@ static int read_pax_stream(FILE *pipe, const char *dest_path,
                 got += PAX_BLOCK;
             }
             xdata[xsz] = '\0';
-            /* only per-file ('x'/'X') xhdrs update the per-entry ccsid */
-            if (type == 'x' || type == 'X') {
-                int found = parse_xhdr_ccsid(xdata, xsz);
-                if (found) ccsid = found;
-            }
+            int is_global = (type == 'g' || type == 'G');
+            parse_xhdr_fields(xdata, (size_t)xsz, &xs, is_global);
             free(xdata);
             continue;
         }
 
         if (type == '0' || type == '\0') {
-            /* Regular file */
             char out_path[4096];
+            char rel_path[4096] = {0};
+
             if (dest_path) {
-                /* single-file mode: always write to dest_path */
                 snprintf(out_path, sizeof(out_path), "%s", dest_path);
+                /* rel_path for single-file: just the basename */
+                const char *bn = strrchr(dest_path, '/');
+                snprintf(rel_path, sizeof(rel_path), "%s", bn ? bn + 1 : dest_path);
             } else {
-                /* tree mode: archive name is at block[0..99] */
                 char arcname[101];
                 memcpy(arcname, block, 100);
                 arcname[100] = '\0';
-                /* strip leading slash */
                 const char *rel = arcname;
                 while (*rel == '/') rel++;
+                /* strip remote_root prefix to get the relative path */
+                if (remote_root) {
+                    const char *rr = remote_root;
+                    while (*rr == '/') rr++;
+                    size_t rrlen = strlen(rr);
+                    if (rrlen > 0 && strncmp(rel, rr, rrlen) == 0
+                            && (rel[rrlen] == '/' || rel[rrlen] == '\0')) {
+                        rel += rrlen;
+                        while (*rel == '/') rel++;
+                    }
+                }
+                snprintf(rel_path, sizeof(rel_path), "%s", rel);
                 snprintf(out_path, sizeof(out_path), "%s/%s", root_dir, rel);
             }
-            if (pax_extract_entry(pipe, out_path, sz,
-                                  force_ccsid ? force_ccsid : ccsid) == 0)
+
+            if (pax_extract_entry(pipe, out_path, sz, &xs,
+                                  meta_db, rel_path[0] ? rel_path : NULL,
+                                  umode, umtime) == 0)
                 nfiles++;
             else
-                nfiles++; /* count even on error so we don't return -1 spuriously */
-            /* reset ccsid for next entry */
-            ccsid = 0;
-            if (dest_path) return 0; /* single-file: done after first entry */
+                nfiles++;
+
+            xhdr_state_reset(&xs);
+            if (dest_path) return 0;
             continue;
         }
 
         if (type == '5') {
-            /* Directory entry — create it */
             if (!dest_path) {
                 char arcname[101];
                 memcpy(arcname, block, 100);
@@ -919,7 +1320,7 @@ static int read_pax_stream(FILE *pipe, const char *dest_path,
                 snprintf(dir_path, sizeof(dir_path), "%s/%s", root_dir, rel);
                 makedirs(dir_path);
             }
-            ccsid = 0;
+            xhdr_state_reset(&xs);
             continue;
         }
 
@@ -927,7 +1328,7 @@ static int read_pax_stream(FILE *pipe, const char *dest_path,
         long long nblocks = (sz + PAX_BLOCK - 1) / PAX_BLOCK;
         for (long long b = 0; b < nblocks; b++)
             if (pipe_read_block(pipe, block) != 0) return nfiles > 0 ? 0 : -1;
-        ccsid = 0;
+        xhdr_state_reset(&xs);
     }
 
     if (nfiles == 0 && dest_path) {
@@ -941,13 +1342,10 @@ static int read_pax_stream(FILE *pipe, const char *dest_path,
  * Argument parsing and SSH dispatch
  * ====================================================================== */
 
-/* Split "user@host:/path" into host ("user@host") and path.
- * Returns 1 if remote syntax detected, 0 if local. */
 static int split_remote(const char *arg, char *host, size_t hostsz,
-                         char *path, size_t pathsz) {
+                        char *path, size_t pathsz) {
     const char *colon = strchr(arg, ':');
     if (!colon) return 0;
-    /* make sure there's a @ before the colon (simple check) */
     size_t hlen = colon - arg;
     if (hlen == 0 || hlen >= hostsz) return 0;
     memcpy(host, arg, hlen); host[hlen] = '\0';
@@ -955,30 +1353,16 @@ static int split_remote(const char *arg, char *host, size_t hostsz,
     return 1;
 }
 
-/* Returns just the filename component of a path */
 __attribute__((unused))
 static const char *basename_of(const char *path) {
     const char *p = strrchr(path, '/');
     return p ? p + 1 : path;
 }
 
-/*
- * convert_to_tmp: if ccsid==1047, convert local file EBCDIC→819 into a
- * temp file and return its path (caller must unlink).
- * Otherwise returns NULL (no conversion needed, use original file).
- */
 /* =========================================================================
- * Recursive upload
+ * Upload helpers
  * ====================================================================== */
 
-/*
- * collect_upload: walk local_dir recursively, building:
- *   - filelist: one "pack_path remote_path\n" per file (pack_path is a temp
- *               file for EBCDIC-converted content, or the original local path)
- *   - chtag:    one chtag command per file for the post-pax tagging pass
- *   - tmps:     temp file paths to unlink after the tar stream is sent
- * No network connections are made here.
- */
 typedef struct { char **paths; size_t n, cap; } strlist_t;
 static void sl_add(strlist_t *l, char *s) {
     if (l->n == l->cap) {
@@ -989,13 +1373,77 @@ static void sl_add(strlist_t *l, char *s) {
 }
 
 /*
- * write_pax_tree: walk local_dir recursively, writing a pax archive to fd.
- * Each file gets an 'x' extended header with IBM.codepage=<ccsid>.
- * EBCDIC source files are converted to 819 on the fly.
- * remote_dir is the archive path prefix for all files.
- * ZOS.taginfo in each 'x' xhdr makes z/OS pax -r set the tag automatically.
+ * upload_one_file: emit optional 'g' header, 'x' header, and file data
+ * for a single file into the pax stream on fd.
+ *
+ * If meta_db is non-NULL and has an entry for rel_path, use it.
+ * Otherwise fall back to auto-detect.
  */
-static int write_pax_tree(int fd, const char *local_dir, const char *remote_dir) {
+static int upload_one_file(int fd, const char *local_path,
+                           const char *remote_path, const char *rel_path,
+                           const struct stat *st, meta_db_t *meta_db) {
+    int ccsid, tag_on;
+    mode_t  mode  = st->st_mode;
+    time_t  mtime = st->st_mtime;
+    const meta_entry_t *me = meta_db ? meta_db_find(meta_db, rel_path) : NULL;
+
+    if (me) {
+        ccsid  = me->ccsid;
+        tag_on = me->tag_on;
+        if (me->mode)  mode  = me->mode;
+        if (me->mtime) mtime = me->mtime;
+    } else {
+        /* auto-detect */
+        int is_text = 0;
+        ccsid = detect_ccsid(local_path, &is_text);
+        if (ccsid < 0) return -1;
+        tag_on = (ccsid != 65535) ? 1 : 0;
+        /* normalise: always tag as 819 unless the meta says 1047 */
+        if (ccsid == 1047) {
+            /* local file was converted to ASCII on download; keep ccsid=1047
+             * so we convert back to EBCDIC and tag 1047 on remote */
+        } else if (ccsid != 65535) {
+            ccsid = 819;
+        }
+    }
+
+    const char *basename = strrchr(remote_path, '/');
+    basename = basename ? basename + 1 : remote_path;
+
+    fprintf(stderr, "z-scp: %s → %s (ccsid=%d tag=%s%s)\n",
+            local_path, remote_path, ccsid, tag_on ? "on" : "off",
+            me ? "" : " auto-detect");
+
+    if (dry_run) return 0;
+
+    /* emit 'g' header for extattr / audit if needed */
+    if (me && (strcmp(me->extattr, "----") != 0
+               || strcmp(me->useraudit, "fff") != 0
+               || strcmp(me->auditoraudit, "---") != 0)) {
+        if (write_pax_ghdr(fd, me, PAX_EBCDIC) != 0) return -1;
+    }
+
+    /* determine the ccsid for the ZOS.taginfo xhdr:
+     * for tag_on=0 (T=off) we emit ZOS.taginfo=0 with the original ccsid */
+    int xhdr_ccsid = ccsid ? ccsid : 65535;
+
+    if (write_pax_xhdr(fd, basename, xhdr_ccsid, tag_on,
+                       PAX_EBCDIC, mode, mtime) != 0 ||
+        write_pax_file(fd, local_path, remote_path, ccsid,
+                       st->st_size, PAX_EBCDIC, mode, mtime) != 0)
+        return -1;
+
+    return 0;
+}
+
+/*
+ * write_pax_tree: walk local_dir recursively, writing a pax archive to fd.
+ * rel_prefix is the path of local_dir relative to the upload root (used for
+ * meta lookups).
+ */
+static int write_pax_tree(int fd, const char *local_dir,
+                          const char *remote_dir, const char *rel_prefix,
+                          meta_db_t *meta_db) {
     DIR *d = opendir(local_dir);
     if (!d) {
         fprintf(stderr, "z-scp: opendir %s: %s\n", local_dir, strerror(errno));
@@ -1009,10 +1457,21 @@ static int write_pax_tree(int fd, const char *local_dir, const char *remote_dir)
     while ((ent = readdir(d)) != NULL) {
         if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
             continue;
+        /* skip the meta file itself — don't upload it to z/OS */
+        if (use_meta && meta_path[0]) {
+            /* compare basename of meta_path with ent->d_name */
+            const char *mb = strrchr(meta_path, '/');
+            mb = mb ? mb + 1 : meta_path;
+            if (strcmp(ent->d_name, mb) == 0) continue;
+        }
 
-        char local_path[4096], remote_path[4096];
+        char local_path[4096], remote_path[4096], rel_path[4096];
         snprintf(local_path,  sizeof(local_path),  "%s/%s", local_dir,  ent->d_name);
         snprintf(remote_path, sizeof(remote_path), "%s/%s", remote_dir, ent->d_name);
+        if (rel_prefix[0])
+            snprintf(rel_path, sizeof(rel_path), "%s/%s", rel_prefix, ent->d_name);
+        else
+            snprintf(rel_path, sizeof(rel_path), "%s", ent->d_name);
 
         struct stat st;
         if (lstat(local_path, &st) != 0) {
@@ -1023,48 +1482,32 @@ static int write_pax_tree(int fd, const char *local_dir, const char *remote_dir)
         if (S_ISDIR(st.st_mode)) {
             sl_add(&subdirs, strdup(local_path));
             sl_add(&subdirs, strdup(remote_path));
+            sl_add(&subdirs, strdup(rel_path));
             continue;
         }
         if (!S_ISREG(st.st_mode)) continue;
 
-        int is_text = 0;
-        int ccsid   = detect_ccsid(local_path, &is_text);
-        if (ccsid < 0) { errors++; continue; }
-        /* tag_ccsid: 819 for all text (including EBCDIC converted), 65535 for binary */
-        int tag_ccsid = (ccsid == 65535) ? 65535 : 819;
-
-        fprintf(stderr, "z-scp: %s → %s (ccsid=%d tag=%d)\n",
-                local_path, remote_path, ccsid, tag_ccsid);
-
-        if (dry_run) continue;
-
-        /* write ZOS.taginfo xhdr then file content */
-        if (write_pax_xhdr(fd, ent->d_name, tag_ccsid, PAX_EBCDIC) != 0 ||
-            write_pax_file(fd, local_path, remote_path, ccsid, st.st_size, PAX_EBCDIC) != 0) {
-            fprintf(stderr, "z-scp: write error for %s\n", local_path);
+        if (upload_one_file(fd, local_path, remote_path, rel_path,
+                            &st, meta_db) != 0)
             errors++;
-        }
     }
     closedir(d);
 
-    /* recurse */
-    for (size_t i = 0; i + 1 < subdirs.n; i += 2) {
-        errors += write_pax_tree(fd, subdirs.paths[i], subdirs.paths[i+1]);
+    for (size_t i = 0; i + 2 < subdirs.n; i += 3) {
+        errors += write_pax_tree(fd, subdirs.paths[i], subdirs.paths[i+1],
+                                 subdirs.paths[i+2], meta_db);
         free(subdirs.paths[i]);
         free(subdirs.paths[i+1]);
+        free(subdirs.paths[i+2]);
     }
     free(subdirs.paths);
     return errors;
 }
 
-/*
- * upload_dir: stream a pax archive into ssh pax -r.
- * ZOS.taginfo in each file's 'x' xhdr causes pax -r to set the tag automatically.
- */
 static int upload_dir(const char *local_dir, const char *remote_host,
-                      const char *remote_dir) {
+                      const char *remote_dir, meta_db_t *meta_db) {
     if (dry_run)
-        return write_pax_tree(-1, local_dir, remote_dir);
+        return write_pax_tree(-1, local_dir, remote_dir, "", meta_db);
 
     char ssh_cmd[4096];
     snprintf(ssh_cmd, sizeof(ssh_cmd),
@@ -1081,12 +1524,10 @@ static int upload_dir(const char *local_dir, const char *remote_host,
     }
 
     int fd = fileno(pipe);
-    int errors = write_pax_tree(fd, local_dir, remote_dir);
+    int errors = write_pax_tree(fd, local_dir, remote_dir, "", meta_db);
 
-    /* write end-of-archive: two 512-byte zero blocks */
     unsigned char eoa[1024] = {0};
-    if (write(fd, eoa, sizeof(eoa)) != sizeof(eoa))
-        errors++;
+    if (write(fd, eoa, sizeof(eoa)) != sizeof(eoa)) errors++;
 
     int rc = pclose(pipe);
     if (rc != 0) {
@@ -1102,16 +1543,8 @@ static int upload_dir(const char *local_dir, const char *remote_host,
  * Recursive download
  * ====================================================================== */
 
-/*
- * download_dir: recursively download remote_dir into local_dir.
- *
- * One SSH connection: ssh /bin/pax -w streams an EBCDIC pax archive which
- * read_pax_stream decodes entirely in C — no local pax, tar, or aepipe needed.
- * Archive entry names are absolute z/OS paths; we strip the leading slash and
- * prepend local_dir to reconstruct the local tree.
- */
 static int download_dir(const char *remote_host, const char *remote_dir,
-                         const char *local_dir) {
+                        const char *local_dir, meta_db_t *meta_db) {
     if (dry_run) {
         fprintf(stderr, "z-scp: dry-run: would download %s:%s → %s\n",
                 remote_host, remote_dir, local_dir);
@@ -1131,7 +1564,7 @@ static int download_dir(const char *remote_host, const char *remote_dir,
     }
 
     makedirs(local_dir);
-    int rc = read_pax_stream(pipe, NULL, local_dir);
+    int rc = read_pax_stream(pipe, NULL, local_dir, remote_dir, meta_db);
     pclose(pipe);
 
     fprintf(stderr, "z-scp: recursive download complete\n");
@@ -1142,31 +1575,25 @@ static int download_dir(const char *remote_host, const char *remote_dir,
  * Single-file upload / download  (pax-based)
  * ====================================================================== */
 
-/*
- * do_upload: stream one file to z/OS as a pax archive with ZOS.taginfo xhdr.
- * z/OS pax -r reads ZOS.taginfo and sets the file tag automatically.
- */
 static int do_upload(const char *local, const char *remote_host,
-                     const char *remote_path) {
-    int is_text = 0;
-    int ccsid = detect_ccsid(local, &is_text);
-    if (ccsid < 0) return 1;
-
-    int tag_ccsid = (ccsid == 65535) ? 65535 : 819;
-
-    fprintf(stderr, "z-scp: upload %s → %s:%s (ccsid=%d tag=%d)\n",
-            local, remote_host, remote_path, ccsid, tag_ccsid);
-
-    if (dry_run) {
-        fprintf(stderr, "z-scp: dry-run: would tag remote as ccsid=%d\n", tag_ccsid);
-        return 0;
-    }
-
+                     const char *remote_path, meta_db_t *meta_db) {
     struct stat st;
     if (stat(local, &st) != 0) {
         fprintf(stderr, "z-scp: stat %s: %s\n", local, strerror(errno));
         return 1;
     }
+
+    /* rel_path for a single file: just the filename */
+    const char *bn = strrchr(local, '/');
+    const char *rel_path = bn ? bn + 1 : local;
+
+    if (dry_run) {
+        fprintf(stderr, "z-scp: dry-run: upload %s → %s:%s\n",
+                local, remote_host, remote_path);
+        return 0;
+    }
+
+    fprintf(stderr, "z-scp: upload %s → %s:%s\n", local, remote_host, remote_path);
 
     char ssh_cmd[4096];
     snprintf(ssh_cmd, sizeof(ssh_cmd),
@@ -1180,17 +1607,10 @@ static int do_upload(const char *local, const char *remote_host,
     }
 
     int fd = fileno(pipe);
-    const char *basename = strrchr(remote_path, '/');
-    basename = basename ? basename + 1 : remote_path;
-
     int rc = 0;
-    if (write_pax_xhdr(fd, basename, tag_ccsid, PAX_EBCDIC) != 0 ||
-        write_pax_file(fd, local, remote_path, ccsid, st.st_size, PAX_EBCDIC) != 0) {
-        fprintf(stderr, "z-scp: pax write error\n");
+    if (upload_one_file(fd, local, remote_path, rel_path, &st, meta_db) != 0)
         rc = 1;
-    }
 
-    /* end-of-archive */
     unsigned char eoa[1024] = {0};
     if (write(fd, eoa, sizeof(eoa)) != sizeof(eoa)) rc = 1;
 
@@ -1200,9 +1620,8 @@ static int do_upload(const char *local, const char *remote_host,
         rc = 1;
     }
 
-    if (!rc) fprintf(stderr, "z-scp: upload complete, tagged ccsid=%d\n", tag_ccsid);
+    if (!rc) fprintf(stderr, "z-scp: upload complete\n");
 
-    /* optional: verify remote bytes via /bin/od */
     if (!rc && do_verify) {
         char od_cmd[4096];
         snprintf(od_cmd, sizeof(od_cmd),
@@ -1215,14 +1634,8 @@ static int do_upload(const char *local, const char *remote_host,
     return rc;
 }
 
-/*
- * do_download: stream one file from z/OS via ssh /bin/pax -w.
- * read_pax_stream decodes the archive entirely in C — no local pax or aepipe needed.
- * ZOS.taginfo in the 'x' xhdr drives CCSID; 1047-tagged content is converted →819.
- * T=off files have no ZOS.taginfo in the pax stream and are written as-is.
- */
 static int do_download(const char *remote_host, const char *remote_path,
-                       const char *local) {
+                       const char *local, meta_db_t *meta_db) {
     fprintf(stderr, "z-scp: download %s:%s → %s\n",
             remote_host, remote_path, local);
 
@@ -1243,7 +1656,7 @@ static int do_download(const char *remote_host, const char *remote_path,
         return 1;
     }
 
-    int rc = read_pax_stream(pipe, local, NULL);
+    int rc = read_pax_stream(pipe, local, NULL, NULL, meta_db);
     pclose(pipe);
 
     if (!rc) fprintf(stderr, "z-scp: download complete\n");
@@ -1255,32 +1668,44 @@ static int do_download(const char *remote_host, const char *remote_path,
  * ====================================================================== */
 
 int main(int argc, char **argv) {
-    /* strip flags — mix of -x and --long-opt accepted in any order */
+    int meta_path_explicit = 0;   /* 1 if --meta-file was used */
+
     while (argc > 1 && argv[1][0] == '-') {
-        if      (strcmp(argv[1], "-r")        == 0) recursive = 1;
-        else if (strcmp(argv[1], "--dry-run") == 0) dry_run   = 1;
-        else if (strcmp(argv[1], "--reprobe") == 0) reprobe   = 1;
-        else if (strcmp(argv[1], "--verify")  == 0) do_verify = 1;
-        else if (strcmp(argv[1], "--ccsid")   == 0) {
+        if      (strcmp(argv[1], "-r")          == 0) recursive = 1;
+        else if (strcmp(argv[1], "--dry-run")   == 0) dry_run   = 1;
+        else if (strcmp(argv[1], "--reprobe")   == 0) reprobe   = 1;
+        else if (strcmp(argv[1], "--verify")    == 0) do_verify = 1;
+        else if (strcmp(argv[1], "--smart")     == 0) smart     = 1;
+        else if (strcmp(argv[1], "--meta")      == 0) use_meta  = 1;
+        else if (strcmp(argv[1], "--ccsid")     == 0) {
             if (argc < 3) { fprintf(stderr, "z-scp: --ccsid requires a value\n"); return 1; }
             force_ccsid = atoi(argv[2]);
             argv++; argc--;
         }
-        else if (strcmp(argv[1], "--smart")   == 0) smart = 1;
+        else if (strcmp(argv[1], "--meta-file") == 0) {
+            if (argc < 3) { fprintf(stderr, "z-scp: --meta-file requires a filename\n"); return 1; }
+            use_meta = 1;
+            meta_path_explicit = 1;
+            snprintf(meta_path, sizeof(meta_path), "%s", argv[2]);
+            argv++; argc--;
+        }
         else break;
         argv++; argc--;
     }
 
     if (argc != 3) {
         fprintf(stderr,
-                "Usage: z-scp [-r] [--dry-run] [--verify] [--ccsid N] <source> <destination>\n"
+                "Usage: z-scp [options] <source> <destination>\n"
                 "  upload:   z-scp localfile       user@host:/remote/path\n"
                 "  download: z-scp user@host:/remote/path  localfile\n"
-                "  -r:           recursive (directory transfer)\n"
-                "  --dry-run:    show what would be done without transferring\n"
-                "  --verify:     after upload, dump first 32 remote bytes via /bin/od\n"
-                "  --ccsid N:    force CCSID N for download (e.g. 1047 for T=off EBCDIC files)\n"
-                "  --smart:      auto-detect encoding for untagged downloads (no ZOS.taginfo)\n");
+                "Options:\n"
+                "  -r              recursive directory transfer\n"
+                "  --dry-run       show what would be done without transferring\n"
+                "  --verify        after upload, dump first 32 remote bytes via /bin/od\n"
+                "  --ccsid N       force CCSID N for download conversion\n"
+                "  --smart         auto-detect encoding for untagged downloads\n"
+                "  --meta          read/write .z-scp-meta.json alongside local files\n"
+                "  --meta-file F   read/write meta data to/from file F\n");
         return 1;
     }
 
@@ -1304,16 +1729,66 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (!src_remote) {
+    int is_upload = !src_remote;
+    /* local side is dst for download, src for upload */
+    const char *local_side = is_upload ? src : dst;
+
+    /* resolve meta path if --meta (bare) was given */
+    if (use_meta && !meta_path_explicit) {
+        int is_dir = 0;
+        struct stat st;
+        if (!is_upload && recursive) is_dir = 1;
+        if ( is_upload && stat(local_side, &st) == 0 && S_ISDIR(st.st_mode)) is_dir = 1;
+        meta_default_path(meta_path, sizeof(meta_path), local_side, is_dir);
+    }
+
+    /* load meta db for upload; allocate empty db for download */
+    meta_db_t meta_db;
+    meta_db_init(&meta_db);
+
+    if (use_meta && is_upload) {
+        if (meta_read(meta_path, &meta_db) == 0)
+            fprintf(stderr, "z-scp: loaded meta from %s (%zu entries)\n",
+                    meta_path, meta_db.n);
+        else
+            fprintf(stderr, "z-scp: no meta file at %s — using auto-detect\n",
+                    meta_path);
+    }
+
+    int rc = 0;
+
+    if (is_upload) {
         if (recursive) {
             struct stat st;
             if (stat(src, &st) == 0 && S_ISDIR(st.st_mode))
-                return upload_dir(src, dst_host, dst_path);
+                rc = upload_dir(src, dst_host, dst_path,
+                                use_meta ? &meta_db : NULL);
+            else
+                rc = do_upload(src, dst_host, dst_path,
+                               use_meta ? &meta_db : NULL);
+        } else {
+            rc = do_upload(src, dst_host, dst_path,
+                           use_meta ? &meta_db : NULL);
         }
-        return do_upload(src, dst_host, dst_path);
     } else {
         if (recursive)
-            return download_dir(src_host, src_path, dst);
-        return do_download(src_host, src_path, dst);
+            rc = download_dir(src_host, src_path, dst,
+                              use_meta ? &meta_db : NULL);
+        else
+            rc = do_download(src_host, src_path, dst,
+                             use_meta ? &meta_db : NULL);
+
+        /* write meta file after download */
+        if (!rc && use_meta && meta_db.n > 0) {
+            const char *host      = src_host;
+            const char *rem_root  = src_path;
+            const char *loc_root  = dst;
+            if (meta_write(meta_path, &meta_db, host, rem_root, loc_root) == 0)
+                fprintf(stderr, "z-scp: wrote meta to %s (%zu entries)\n",
+                        meta_path, meta_db.n);
+        }
     }
+
+    meta_db_free(&meta_db);
+    return rc;
 }
