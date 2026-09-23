@@ -53,18 +53,25 @@
 #include <stdint.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 
+/* Tunable safety limits */
+#define XHDR_MAX_BYTES   (1u << 20)   /* 1 MiB cap for a single xhdr blob */
+#define SMART_MAX_BYTES  (16u << 20)  /* 16 MiB cap for --smart re-scan */
+#define META_MAX_BYTES   (16u << 20)  /* 16 MiB cap for meta JSON (read side) */
+#define CACHE_MAX_BYTES  65536
+
 /* =========================================================================
  * Conversion tables  (from cat2.c — round-trip verified)
  * ====================================================================== */
 
 /* ISO-8859-1 (CCSID 819) → EBCDIC-1047  (needed for EBCDIC PAX headers) */
-static const unsigned char a2e[256] __attribute__((unused)) = {
+static const unsigned char a2e[256] = {
     0x00, 0x01, 0x02, 0x03, 0x37, 0x2d, 0x2e, 0x2f, 0x16, 0x05, 0x15, 0x0b,
     0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x3c, 0x3d, 0x32, 0x26,
     0x18, 0x19, 0x3f, 0x27, 0x1c, 0x1d, 0x1e, 0x1f, 0x40, 0x5a, 0x7f, 0x7b,
@@ -168,9 +175,137 @@ static const char utf8pat[256] = {
 
 typedef enum { PAX_ASCII = 0, PAX_EBCDIC = 1 } pax_enc_t;
 
+/* Probed pax-header encoding for the current host (see get_host_enc).
+ * Diagnostic only: transfers pin PAX_EBCDIC with explicit
+ * _BPXK_AUTOCVT=ON (see pipe_read_block), so a mis-probe can never corrupt
+ * data.  Defaults to EBCDIC (z/OS) when no probe ran (e.g. --dry-run). */
+static pax_enc_t g_pax_enc = PAX_EBCDIC;
+
+/* =========================================================================
+ * ssh subprocess helpers (no local shell — fixes command injection)
+ *
+ * Previously every transfer built "ssh ... '...'" strings for popen()/
+ * system(), so a crafted host/path could execute arbitrary local commands.
+ * These helpers fork+exec ssh directly: host travels as a single argv
+ * element (never interpreted by /bin/sh).  The remote command string is
+ * still interpreted by the *remote* shell, so remote paths are
+ * single-quote escaped by ssh_quote_append().
+ * ====================================================================== */
+
+/* Append s to out (size outsz, *off = current len) wrapped in single quotes,
+ * escaping embedded single quotes as '"'"'.  Returns 0 ok, -1 truncated. */
+static int ssh_quote_append(char *out, size_t outsz, size_t *off,
+                            const char *s) {
+    size_t o = *off;
+    if (o + 1 >= outsz) return -1;
+    out[o++] = '\'';
+    for (; *s; s++) {
+        if (*s == '\'') {
+            if (o + 4 >= outsz) return -1;
+            memcpy(out + o, "'\"'\"'", 4); o += 4;
+        } else {
+            if (o + 1 >= outsz) return -1;
+            out[o++] = *s;
+        }
+    }
+    if (o + 1 >= outsz) return -1;
+    out[o++] = '\'';
+    out[o] = '\0';
+    *off = o;
+    return 0;
+}
+
+/* Reject hosts that could smuggle ssh options.  Host travels as one argv
+ * element so spaces/quotes are harmless, but a leading '-' would be parsed
+ * as flags by ssh. */
+static int host_is_safe(const char *host) {
+    if (!host || !*host) return 0;
+    if (host[0] == '-') return 0;
+    if (strchr(host, '\n') || strchr(host, '\r')) return 0;
+    return 1;
+}
+
+/* Spawn "ssh -o BatchMode=yes <host> <remote_cmd>".
+ * direction: 'r' → return FILE* reading child's stdout; 'w' → writing to
+ * child's stdin.  *pid_out receives the child pid for ssh_wait().
+ * Returns NULL on failure. */
+static FILE *ssh_spawn(const char *host, const char *remote_cmd, char direction,
+                       pid_t *pid_out) {
+    if (!host_is_safe(host)) {
+        fprintf(stderr, "z-scp: refusing unsafe ssh host '%s'\n", host);
+        return NULL;
+    }
+    int fds[2];
+    if (pipe(fds) != 0) {
+        fprintf(stderr, "z-scp: pipe: %s\n", strerror(errno));
+        return NULL;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "z-scp: fork: %s\n", strerror(errno));
+        close(fds[0]); close(fds[1]);
+        return NULL;
+    }
+    if (pid == 0) {
+        /* child */
+        if (direction == 'r') {
+            dup2(fds[1], STDOUT_FILENO);
+        } else {
+            dup2(fds[0], STDIN_FILENO);
+        }
+        close(fds[0]); close(fds[1]);
+        execlp("ssh", "ssh", "-o", "BatchMode=yes", host, remote_cmd,
+               (char *)NULL);
+        _exit(127);
+    }
+    /* parent */
+    FILE *fp;
+    if (direction == 'r') {
+        close(fds[1]);
+        fp = fdopen(fds[0], "r");
+    } else {
+        close(fds[0]);
+        fp = fdopen(fds[1], "w");
+    }
+    if (!fp) {
+        close(direction == 'r' ? fds[0] : fds[1]);
+        return NULL;
+    }
+    *pid_out = pid;
+    return fp;
+}
+
+/* fclose() the stream and wait for the child; returns the raw wait status
+ * (like pclose: use WIFEXITED/WEXITSTATUS on success, -1 on error). */
+static int ssh_wait(FILE *fp, pid_t pid) {
+    if (fp) fclose(fp);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+        ;
+    return status;
+}
+
+/* Run a remote command whose output we discard, streaming-side equivalent
+ * of system() but without a local shell (used by --verify). */
+static int ssh_run_discard(const char *host, const char *remote_cmd) {
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        execlp("ssh", "ssh", "-o", "BatchMode=yes", host, remote_cmd,
+               (char *)NULL);
+        _exit(127);
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+        ;
+    return status;
+}
+
 /* =========================================================================
  * Host capability cache  (~/.zscp_hosts.json)
  * ====================================================================== */
+
+static void json_escape(const char *s, char *buf, size_t bufsz);
 
 static void cache_path(char *buf, size_t sz) {
     const char *home = getenv("HOME");
@@ -188,17 +323,27 @@ static int cache_read(const char *host) {
     fseek(f, 0, SEEK_END);
     long fsz = ftell(f);
     rewind(f);
-    if (fsz <= 0 || fsz > 65536) { fclose(f); return -1; }
+    if (fsz <= 0 || fsz > CACHE_MAX_BYTES) { fclose(f); return -1; }
     char *buf = malloc(fsz + 1);
     if (!buf) { fclose(f); return -1; }
     if (fread(buf, 1, fsz, f) != (size_t)fsz) { free(buf); fclose(f); return -1; }
     fclose(f);
     buf[fsz] = '\0';
 
+    /* Exact key match: "host" must be followed by optional space + ':' so
+     * that host "pok" can never match an entry for "pok56". */
     char needle[300];
     snprintf(needle, sizeof(needle), "\"%s\"", host);
-    char *p = strstr(buf, needle);
-    if (!p) { free(buf); return -1; }
+    size_t nlen = strlen(needle);
+    char *p = buf;
+    int found = 0;
+    while ((p = strstr(p, needle)) != NULL) {
+        const char *t = p + nlen;
+        while (*t == ' ' || *t == '\t') t++;
+        if (*t == ':') { found = 1; break; }
+        p += nlen;
+    }
+    if (!found) { free(buf); return -1; }
     char *q = strstr(p, "\"pax_encoding\"");
     if (!q || q - p > 512) { free(buf); return -1; }
     q = strchr(q, ':');
@@ -226,7 +371,7 @@ static void cache_write(const char *host, pax_enc_t enc) {
         fseek(f, 0, SEEK_END);
         fsz = ftell(f);
         rewind(f);
-        if (fsz > 0 && fsz < 65536) {
+        if (fsz > 0 && fsz < CACHE_MAX_BYTES) {
             existing = malloc(fsz + 1);
             if (existing) {
                 if (fread(existing, 1, fsz, f) != (size_t)fsz) {
@@ -242,10 +387,16 @@ static void cache_write(const char *host, pax_enc_t enc) {
     char ts[32];
     strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", tm_utc);
 
-    char entry[512];
-    snprintf(entry, sizeof(entry),
+    char eschost[512];
+    json_escape(host, eschost, sizeof(eschost));
+    char entry[1024];
+    if (snprintf(entry, sizeof(entry),
              "  \"%s\": { \"pax_encoding\": \"%s\", \"detected\": \"%s\" }",
-             host, enc == PAX_EBCDIC ? "ebcdic" : "ascii", ts);
+             eschost, enc == PAX_EBCDIC ? "ebcdic" : "ascii", ts)
+            >= (int)sizeof(entry)) {
+        free(existing);
+        return; /* host too long; don't write a truncated entry */
+    }
 
     f = fopen(path, "w");
     if (!f) { free(existing); return; }
@@ -320,24 +471,26 @@ static pax_enc_t detect_magic(const unsigned char hdr[512]) {
     return PAX_ASCII; /* unknown — default safe */
 }
 
-/* Ask remote host to produce a tiny PAX archive, inspect its magic field. */
-static pax_enc_t probe_host(const char *host) {
+/* Ask remote host to produce a tiny PAX archive, inspect its magic field.
+ * Uses a mktemp-created remote file (no predictable /tmp name) and no
+ * local shell: host travels as a single ssh argv element.
+ * Returns PAX_ASCII/PAX_EBCDIC, or -1 when the probe itself failed
+ * (caller falls back to EBCDIC without caching). */
+static int probe_host(const char *host) {
     fprintf(stderr, "z-scp: probing PAX header encoding for %s...\n", host);
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "ssh -o BatchMode=yes %s "
-             "/bin/sh -c '"
-             "unset _BPXK_AUTOCVT && "
-             "/bin/echo x>/tmp/__zscp_probe__ && "
-             "/bin/pax -w -x pax /tmp/__zscp_probe__; "
-             "/bin/rm -f /tmp/__zscp_probe__'",
-             host);
+    static const char remote_cmd[] =
+        "unset _BPXK_AUTOCVT; "
+        "T=$(/bin/mktemp /tmp/__zscp_probe_XXXXXX) || exit 1; "
+        "/bin/echo x>\"$T\" && "
+        "/bin/pax -w -x pax \"$T\"; rc=$?; "
+        "/bin/rm -f \"$T\"; exit $rc";
 
-    FILE *p = popen(cmd, "r");
+    pid_t pid = -1;
+    FILE *p = ssh_spawn(host, remote_cmd, 'r', &pid);
     if (!p) {
-        fprintf(stderr, "z-scp: probe popen failed, assuming ASCII\n");
-        return PAX_ASCII;
+        fprintf(stderr, "z-scp: probe spawn failed\n");
+        return -1;
     }
 
     unsigned char hdr[512];
@@ -347,21 +500,23 @@ static pax_enc_t probe_host(const char *host) {
         if (n == 0) break;
         got += n;
     }
-    pclose(p);
+    int status = ssh_wait(p, pid);
 
-    if (got < 512) {
-        fprintf(stderr, "z-scp: probe got only %zu bytes, assuming ASCII\n", got);
-        return PAX_ASCII;
+    if (got < 512 || status != 0) {
+        fprintf(stderr, "z-scp: probe failed (got %zu bytes, status %d)\n",
+                got, status);
+        return -1;
     }
 
     pax_enc_t enc = detect_magic(hdr);
     fprintf(stderr, "z-scp: %s uses %s PAX headers\n",
             host, enc == PAX_EBCDIC ? "EBCDIC" : "ASCII");
-    return enc;
+    return (int)enc;
 }
 
-/* Return cached or freshly probed PAX encoding for host. */
-__attribute__((unused))
+/* Return cached or freshly probed PAX encoding for host.
+ * Unprobed/unreachable hosts fall back to EBCDIC (z/OS) without caching,
+ * so a transient ssh failure can never poison the cache. */
 static pax_enc_t get_host_enc(const char *host, int reprobe_flag) {
     if (!reprobe_flag) {
         int cached = cache_read(host);
@@ -371,9 +526,13 @@ static pax_enc_t get_host_enc(const char *host, int reprobe_flag) {
             return (pax_enc_t)cached;
         }
     }
-    pax_enc_t enc = probe_host(host);
-    cache_write(host, enc);
-    return enc;
+    int probed = probe_host(host);
+    if (probed < 0) {
+        fprintf(stderr, "z-scp: probe failed for %s, assuming EBCDIC\n", host);
+        return PAX_EBCDIC;
+    }
+    cache_write(host, (pax_enc_t)probed);
+    return (pax_enc_t)probed;
 }
 
 /* =========================================================================
@@ -449,7 +608,12 @@ static int detect_ccsid(const char *path, int *is_text) {
     if (s.ascii_cnt > 0 && !s.utf8_format_error && s.utf8_st == 1) {
         *is_text = 1; return 819;
     }
-    /* >5% match: probable but not pure */
+    /* Near match (within 5% of perfect, i.e. score > ~95.2%): probable
+     * text but not pure — e.g. text with a few stray bytes.  The 105/100
+     * factors are a 5% *tolerance*, not a 5%-of-total threshold: rewriting
+     * this as cnt*20 > total would misclassify virtually every binary
+     * (random data scores ~40-50% on both tables) as text.  Mid-range
+     * scores correctly fall through to 65535/binary below. */
     if (s.ebcdic_cnt > 0 && (s.ebcdic_cnt * 105) / (s.total_ebcdic * 100) > 0) {
         *is_text = 0; return 1047;
     }
@@ -512,8 +676,11 @@ static void meta_db_init(meta_db_t *db) {
 
 static meta_entry_t *meta_db_add(meta_db_t *db) {
     if (db->n == db->cap) {
-        db->cap = db->cap ? db->cap * 2 : 64;
-        db->entries = realloc(db->entries, db->cap * sizeof(meta_entry_t));
+        size_t ncap = db->cap ? db->cap * 2 : 64;
+        meta_entry_t *nn = realloc(db->entries, ncap * sizeof(meta_entry_t));
+        if (!nn) return NULL;
+        db->entries = nn;
+        db->cap = ncap;
     }
     meta_entry_t *e = &db->entries[db->n++];
     memset(e, 0, sizeof(*e));
@@ -538,29 +705,47 @@ static void meta_db_free(meta_db_t *db) {
 
 /*
  * json_escape: write s into buf (size bufsz) with JSON string escaping.
- * Only needs to handle printable ASCII (all our strings are paths/flags).
+ * Handles quotes, backslashes and C0 controls (\n etc.); other bytes
+ * pass through.  Truncates safely on overflow.
  */
 static void json_escape(const char *s, char *buf, size_t bufsz) {
     size_t o = 0;
-    for (; *s && o + 4 < bufsz; s++) {
+    static const char hexd[] = "0123456789abcdef";
+    for (; *s && o + 1 < bufsz; s++) {
         unsigned char c = (unsigned char)*s;
-        if (c == '"' || c == '\\') { buf[o++] = '\\'; buf[o++] = c; }
-        else buf[o++] = c;
+        if (c == '"' || c == '\\') {
+            if (o + 2 >= bufsz) break;
+            buf[o++] = '\\'; buf[o++] = (char)c;
+        } else if (c < 0x20) {
+            if (o + 6 >= bufsz) break;
+            buf[o++] = '\\'; buf[o++] = 'u'; buf[o++] = '0'; buf[o++] = '0';
+            buf[o++] = hexd[(c >> 4) & 0xf]; buf[o++] = hexd[c & 0xf];
+        } else {
+            buf[o++] = (char)c;
+        }
     }
     buf[o] = '\0';
 }
 
 /*
- * meta_write: serialise meta_db to a JSON file.
+ * meta_write: serialise meta_db to a JSON file, atomically (write to a
+ * sibling temp file, fsync, rename) so a crash never leaves a truncated
+ * sidecar behind.
  * header fields (host, remote_root, local_root) are passed directly.
  */
 static int meta_write(const char *path, const meta_db_t *db,
                       const char *host, const char *remote_root,
                       const char *local_root) {
-    FILE *f = fopen(path, "w");
+    char tmp[4200];
+    if (snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int)getpid())
+            >= (int)sizeof(tmp)) {
+        fprintf(stderr, "z-scp: meta path too long: %s\n", path);
+        return -1;
+    }
+    FILE *f = fopen(tmp, "w");
     if (!f) {
         fprintf(stderr, "z-scp: cannot write meta file %s: %s\n",
-                path, strerror(errno));
+                tmp, strerror(errno));
         return -1;
     }
 
@@ -591,7 +776,22 @@ static int meta_write(const char *path, const meta_db_t *db,
     }
 
     fprintf(f, "  }\n}\n");
+    if (fflush(f) != 0) {
+        fprintf(stderr, "z-scp: cannot flush meta file %s: %s\n",
+                tmp, strerror(errno));
+        fclose(f);
+        unlink(tmp);
+        return -1;
+    }
+    int mfd = fileno(f);
+    if (mfd >= 0) fsync(mfd);
     fclose(f);
+    if (rename(tmp, path) != 0) {
+        fprintf(stderr, "z-scp: cannot publish meta file %s: %s\n",
+                path, strerror(errno));
+        unlink(tmp);
+        return -1;
+    }
     return 0;
 }
 
@@ -645,13 +845,18 @@ static int meta_read(const char *path, meta_db_t *db) {
     fseek(f, 0, SEEK_END);
     long fsz = ftell(f);
     rewind(f);
-    if (fsz <= 0 || fsz > 16 * 1024 * 1024) { fclose(f); return -1; }
+    if (fsz <= 0 || fsz > (long)META_MAX_BYTES) { fclose(f); return -1; }
 
     char *buf = malloc(fsz + 1);
     if (!buf) { fclose(f); return -1; }
     if (fread(buf, 1, fsz, f) != (size_t)fsz) { free(buf); fclose(f); return -1; }
     fclose(f);
     buf[fsz] = '\0';
+
+    long long ver = json_int_val(buf, "version", 1);
+    if (ver != 1)
+        fprintf(stderr, "z-scp: warning: meta %s has version %lld (expected 1)\n",
+                path, ver);
 
     /* Locate the "files" object */
     const char *files_start = strstr(buf, "\"files\"");
@@ -680,11 +885,17 @@ static int meta_read(const char *path, meta_db_t *db) {
         p++;
         char rel_path[4096] = {0};
         size_t rlen = 0;
-        while (*p && *p != '"' && rlen + 1 < sizeof(rel_path)) {
-            if (*p == '\\') p++;
+        int key_trunc = 0;
+        while (*p && *p != '"') {
+            if (rlen + 1 >= sizeof(rel_path)) { key_trunc = 1; break; }
+            if (*p == '\\' && *(p+1)) p++;
             rel_path[rlen++] = *p++;
         }
         rel_path[rlen] = '\0';
+        if (key_trunc) {
+            fprintf(stderr, "z-scp: warning: meta key too long, skipping\n");
+            while (*p && *p != '"') p++;
+        }
         if (*p == '"') p++;
 
         /* skip to ':' then '{' */
@@ -693,15 +904,26 @@ static int meta_read(const char *path, meta_db_t *db) {
         while (*p == ' ' || *p == '\t' || *p == '\n') p++;
         if (*p != '{') continue;
 
-        /* find matching '}' — one level deep */
+        /* find matching '}' — one level deep, string-aware so braces
+         * inside quoted values (e.g. paths) don't break the scan. */
         const char *obj_start = p + 1;
         int depth = 1;
+        int in_str = 0, esc = 0;
         const char *q = p + 1;
         while (*q && depth > 0) {
-            if (*q == '{') depth++;
-            else if (*q == '}') depth--;
+            char c = *q;
+            if (in_str) {
+                if (esc) esc = 0;
+                else if (c == '\\') esc = 1;
+                else if (c == '"') in_str = 0;
+            } else {
+                if (c == '"') in_str = 1;
+                else if (c == '{') depth++;
+                else if (c == '}') depth--;
+            }
             q++;
         }
+        if (depth > 0) break; /* truncated file */
         /* q now points just past the closing '}' */
         size_t obj_len = (size_t)(q - obj_start - 1);
         char *entry_buf = malloc(obj_len + 1);
@@ -710,16 +932,26 @@ static int meta_read(const char *path, meta_db_t *db) {
         entry_buf[obj_len] = '\0';
 
         meta_entry_t *e = meta_db_add(db);
-        snprintf(e->rel_path, sizeof(e->rel_path), "%s", rel_path);
+        if (!e) { free(entry_buf); free(buf); return -1; }
+        if (snprintf(e->rel_path, sizeof(e->rel_path), "%s", rel_path)
+                >= (int)sizeof(e->rel_path)) {
+            fprintf(stderr, "z-scp: warning: meta key truncated: %s\n", rel_path);
+        }
 
-        e->ccsid   = (int)json_int_val(entry_buf, "ccsid",  0);
+        long long ccsid_ll = json_int_val(entry_buf, "ccsid",  0);
+        e->ccsid = (ccsid_ll == 819 || ccsid_ll == 1047 || ccsid_ll == 65535)
+                   ? (int)ccsid_ll : 0;
         e->mtime   = (time_t)json_int_val(entry_buf, "mtime", 0);
 
         char tmp[64];
         if (json_str_val(entry_buf, "tag",  tmp, sizeof(tmp)))
             e->tag_on = (strcmp(tmp, "on") == 0) ? 1 : 0;
-        if (json_str_val(entry_buf, "mode", tmp, sizeof(tmp)))
-            e->mode = (mode_t)strtol(tmp, NULL, 8);
+        if (json_str_val(entry_buf, "mode", tmp, sizeof(tmp))) {
+            char *end = NULL;
+            long mv = strtol(tmp, &end, 8);
+            if (end != tmp && mv >= 0 && mv <= 07777)
+                e->mode = (mode_t)mv;
+        }
         /* copy short fixed-width fields; clamp to buffer without GCC truncation warning */
         if (json_str_val(entry_buf, "extattr", tmp, sizeof(tmp))) {
             size_t n = strlen(tmp); if (n >= sizeof(e->extattr)) n = sizeof(e->extattr)-1;
@@ -746,21 +978,25 @@ static int meta_read(const char *path, meta_db_t *db) {
  * meta_default_path: build the default meta file path.
  * For a directory transfer, it lives inside the local root as .z-scp-meta.json.
  * For a single-file transfer, it lives in the same directory as the local file.
+ * Returns 0 ok, -1 if the result does not fit.
  */
-static void meta_default_path(char *out, size_t outsz,
+static int meta_default_path(char *out, size_t outsz,
                                const char *local, int is_dir) {
     if (is_dir) {
-        snprintf(out, outsz, "%s/.z-scp-meta.json", local);
+        return snprintf(out, outsz, "%s/.z-scp-meta.json", local)
+               < (int)outsz ? 0 : -1;
     } else {
         /* place alongside the file */
         const char *slash = strrchr(local, '/');
         if (slash) {
             size_t dlen = (size_t)(slash - local);
-            if (dlen >= outsz - 18) dlen = outsz - 18;  /* clamp */
+            if (dlen + 18 > outsz) return -1;
             memcpy(out, local, dlen);
             memcpy(out + dlen, "/.z-scp-meta.json", 18);
+            return 0;
         } else {
-            snprintf(out, outsz, ".z-scp-meta.json");
+            return snprintf(out, outsz, ".z-scp-meta.json")
+                   < (int)outsz ? 0 : -1;
         }
     }
 }
@@ -788,7 +1024,9 @@ static ssize_t pax_write(int fd, const void *buf, size_t n, pax_enc_t enc) {
     return (ssize_t)done;
 }
 
-/* Write exactly n zero bytes to fd */
+/* Write exactly n zero bytes to fd.
+ * NOTE: raw write() is correct even for PAX_EBCDIC: e2a[0]==0, and AUTOCVT
+ * maps 0x00 back to 0x00, so padding is invariant under the transport. */
 static int write_zeros(int fd, size_t n) {
     unsigned char zero[512] = {0};
     while (n > 0) {
@@ -801,6 +1039,15 @@ static int write_zeros(int fd, size_t n) {
 
 /*
  * set_checksum: fill the ustar checksum field.
+ *
+ * NOTE: the sum is intentionally computed on the *logical* (pre-transport)
+ * header bytes.  For PAX_EBCDIC uploads pax_write() translates each byte
+ * with e2a[] on the wire, but z/OS SSH AUTOCVT translates stdin back with
+ * a2e[] before pax sees it (verified: `echo 111 | ssh host od -x` shows
+ * F1 F1 F1 15, i.e. ASCII→EBCDIC in transit), so remote pax validates the
+ * checksum against the original bytes.  Checksumming the wire bytes would
+ * therefore *break* validation — the transport conversion must not apply
+ * to this calculation.
  */
 static void set_checksum(unsigned char hdr[512], pax_enc_t enc) {
     (void)enc;
@@ -823,42 +1070,41 @@ static void set_checksum(unsigned char hdr[512], pax_enc_t enc) {
  * z/OS pax -r applies 'g' header values to the immediately following file
  * entry, which is exactly what we want (one 'g' per file that needs it).
  */
+/* Append one "LEN KEY=VALUE\n" pax record to xdata (size xdatsz, *xlen used).
+ * Returns 0 ok, -1 on overflow. */
+static int xhdr_append(char *xdata, size_t xdatsz, int *xlen,
+                       const char *key, const char *val) {
+    char tmp[128];
+    int reclen, n = -1;
+    for (reclen = 1; reclen <= 99; reclen++) {
+        n = snprintf(tmp, sizeof(tmp), "%d %s=%s\n", reclen, key, val);
+        if (n == reclen) break;
+    }
+    if (n != reclen) return -1;
+    if (*xlen + n >= (int)xdatsz) return -1;
+    memcpy(xdata + *xlen, tmp, (size_t)n);
+    *xlen += n;
+    return 0;
+}
+
 static int write_pax_ghdr(int fd, const meta_entry_t *e, pax_enc_t enc) {
     char xdata[512];
     int  xlen = 0;
 
-    /* ZOS.taginfo default in 'g' — always include to match z/OS pax -w output */
-    /* (z/OS pax -r ignores the global ZOS.taginfo; the per-file 'x' overrides) */
-    char tmp[128];
     /* extattr */
     if (strcmp(e->extattr, "----") != 0) {
-        int n;
-        for (int reclen = 1; reclen <= 99; reclen++) {
-            n = snprintf(tmp, sizeof(tmp), "%d ZOS.extattr=%s\n",
-                         reclen, e->extattr);
-            if (n == reclen) break;
-        }
-        xlen += snprintf(xdata + xlen, sizeof(xdata) - xlen, "%s", tmp);
+        if (xhdr_append(xdata, sizeof(xdata), &xlen, "ZOS.extattr", e->extattr) != 0)
+            return -1;
     }
     /* useraudit */
     if (strcmp(e->useraudit, "fff") != 0) {
-        int n;
-        for (int reclen = 1; reclen <= 99; reclen++) {
-            n = snprintf(tmp, sizeof(tmp), "%d ZOS.useraudit=%s\n",
-                         reclen, e->useraudit);
-            if (n == reclen) break;
-        }
-        xlen += snprintf(xdata + xlen, sizeof(xdata) - xlen, "%s", tmp);
+        if (xhdr_append(xdata, sizeof(xdata), &xlen, "ZOS.useraudit", e->useraudit) != 0)
+            return -1;
     }
     /* auditoraudit */
     if (strcmp(e->auditoraudit, "---") != 0) {
-        int n;
-        for (int reclen = 1; reclen <= 99; reclen++) {
-            n = snprintf(tmp, sizeof(tmp), "%d ZOS.auditoraudit=%s\n",
-                         reclen, e->auditoraudit);
-            if (n == reclen) break;
-        }
-        xlen += snprintf(xdata + xlen, sizeof(xdata) - xlen, "%s", tmp);
+        if (xhdr_append(xdata, sizeof(xdata), &xlen, "ZOS.auditoraudit", e->auditoraudit) != 0)
+            return -1;
     }
 
     if (xlen == 0) return 0;   /* nothing to emit */
@@ -890,16 +1136,12 @@ static int write_pax_xhdr(int fd, const char *basename,
                            pax_enc_t enc, mode_t mode, time_t mtime) {
     char xdata[128];
     int  xlen = 0;
-    char tmp[64];
+    char val[32];
     int flag = tag_on ? 1 : 0;
     int out_ccsid = (ccsid == 65535) ? 65535 : (ccsid ? ccsid : 65535);
-    int reclen;
-    for (reclen = 1; reclen <= 99; reclen++) {
-        int n = snprintf(tmp, sizeof(tmp), "%d ZOS.taginfo=%d %d\n",
-                         reclen, flag, out_ccsid);
-        if (n == reclen) break;
-    }
-    xlen += snprintf(xdata + xlen, sizeof(xdata) - xlen, "%s", tmp);
+    snprintf(val, sizeof(val), "%d %d", flag, out_ccsid);
+    if (xhdr_append(xdata, sizeof(xdata), &xlen, "ZOS.taginfo", val) != 0)
+        return -1;
 
     unsigned char hdr[512];
     memset(hdr, 0, 512);
@@ -922,18 +1164,65 @@ static int write_pax_xhdr(int fd, const char *basename,
 /*
  * write_pax_file: write the ustar file header + content to fd.
  *
- * ccsid controls content encoding:
- *   1047 → local file is ASCII (was converted on download); convert ASCII→EBCDIC
- *           so z/OS stores EBCDIC bytes under the 1047 tag.
- *   819 / 65535 → pass through as-is.
+ * to_ebcdic controls content encoding:
+ *   1 → local file holds ASCII (post-download state or ASCII source);
+ *       convert ASCII→EBCDIC via a2e[] so z/OS stores EBCDIC bytes.
+ *       Set ONLY from an explicit meta entry (ccsid=1047) or --ccsid.
+ *   0 → pass through as-is.  This covers 819/binary AND auto-detected
+ *       1047 without meta: in the latter case the local bytes already look
+ *       like EBCDIC, so running them through a2e[] again would double-
+ *       convert (EBCDIC-as-Latin1 → garbage).  Passthrough stores the
+ *       on-disk bytes under the 1047 tag, which is the faithful choice.
+ *
+ * The file size comes from fstat() on the open fd (not the caller's stat),
+ * and at most that many bytes are streamed: a concurrent grower is
+ * truncated to the header size so the archive stays in sync; a concurrent
+ * shrink is zero-padded and reported as an error.
  */
 static int write_pax_file(int fd, const char *path, const char *arcname,
-                          int ccsid, off_t filesize, pax_enc_t enc,
+                          int to_ebcdic, pax_enc_t enc,
                           mode_t mode, time_t mtime) {
+    int src = open(path, O_RDONLY);
+    if (src < 0) { fprintf(stderr, "z-scp: open %s: %s\n", path, strerror(errno)); return -1; }
+    struct stat fst;
+    if (fstat(src, &fst) != 0) {
+        fprintf(stderr, "z-scp: fstat %s: %s\n", path, strerror(errno));
+        close(src);
+        return -1;
+    }
+    if (!S_ISREG(fst.st_mode)) {
+        fprintf(stderr, "z-scp: not a regular file: %s\n", path);
+        close(src);
+        return -1;
+    }
+    off_t filesize = fst.st_size;
+
     unsigned char hdr[512];
     memset(hdr, 0, 512);
 
-    snprintf((char *)hdr, 100, "%.99s", arcname);
+    /* ustar name + prefix (supports paths >100 chars via prefix/name split) */
+    {
+        size_t alen = strlen(arcname);
+        if (alen <= 100) {
+            memcpy(hdr, arcname, alen);
+        } else {
+            size_t split = 0;
+            for (size_t i = alen; i > 0; i--) {
+                if (arcname[i - 1] == '/') {
+                    size_t pre = i - 1, rest = alen - i;
+                    if (pre <= 155 && rest <= 100 && rest > 0) { split = i; break; }
+                }
+                if (alen - i > 100) break; /* name part only grows toward front */
+            }
+            if (!split) {
+                fprintf(stderr, "z-scp: name too long for ustar: %s\n", arcname);
+                close(src);
+                return -1;
+            }
+            memcpy(hdr, arcname + split, alen - split);
+            memcpy(hdr + 345, arcname, split - 1);
+        }
+    }
     snprintf((char *)hdr + 100,    8, "%07o", (unsigned)(mode & 07777));
     snprintf((char *)hdr + 108,    8, "%07o", 0);
     snprintf((char *)hdr + 116,    8, "%07o", 0);
@@ -942,52 +1231,46 @@ static int write_pax_file(int fd, const char *path, const char *arcname,
     hdr[156] = '0'; /* regular file */
     memcpy(hdr + 257, "ustar\0" "00", 8);
     set_checksum(hdr, enc);
-    if (pax_write(fd, hdr, 512, enc) != 512) return -1;
-
-    int src = open(path, O_RDONLY);
-    if (src < 0) { fprintf(stderr, "z-scp: open %s: %s\n", path, strerror(errno)); return -1; }
+    if (pax_write(fd, hdr, 512, enc) != 512) { close(src); return -1; }
 
     unsigned char ibuf[8192];
     unsigned char obuf[8192];
     ssize_t nr;
-    off_t written = 0;
-    while ((nr = read(src, ibuf, sizeof(ibuf))) > 0) {
-        if (enc == PAX_EBCDIC) {
-            /*
-             * pax_write applies e2a[]; AUTOCVT on z/OS stdin applies a2e[].
-             * Net: a2e[e2a[x]] = x — identity.
-             * We feed pax_write the bytes we want z/OS to store on disk.
-             *
-             * ccsid==1047: z/OS stores EBCDIC.  Local file holds ASCII (we
-             *   converted on download).  Convert ASCII→EBCDIC via a2e[] first,
-             *   then pax_write sends e2a[a2e[ascii]] = ascii byte... wait:
-             *   we want z/OS to store EBCDIC, so we must give pax_write the
-             *   EBCDIC byte.  AUTOCVT will then do a2e[e2a[ebcdic]] = ebcdic. ✓
-             *   So: obuf[i] = a2e[ibuf[i]]  (ASCII→EBCDIC), then pax_write
-             *   applies e2a[] → sends e2a[a2e[ascii]].  AUTOCVT does
-             *   a2e[e2a[a2e[ascii]]] = a2e[ascii] = ebcdic. ✓
-             * ccsid==819 or binary: feed as-is → z/OS stores original bytes. ✓
-             */
-            if (ccsid == 1047)
-                for (ssize_t i = 0; i < nr; i++) obuf[i] = a2e[ibuf[i]];
-            else
-                memcpy(obuf, ibuf, nr);
-        } else {
-            /* PAX_ASCII (non-z/OS target) */
-            if (ccsid == 1047)
-                for (ssize_t i = 0; i < nr; i++) obuf[i] = a2e[ibuf[i]];
-            else
-                memcpy(obuf, ibuf, nr);
-        }
-        if (pax_write(fd, obuf, nr, enc) != (ssize_t)nr) { close(src); return -1; }
+    off_t remaining = filesize, written = 0;
+    int rc = 0;
+    while (remaining > 0) {
+        size_t want = (remaining < (off_t)sizeof(ibuf)) ? (size_t)remaining : sizeof(ibuf);
+        nr = read(src, ibuf, want);
+        if (nr < 0 && errno == EINTR) continue;
+        if (nr <= 0) break; /* EOF early (shrunk) or error */
+        if (to_ebcdic)
+            for (ssize_t i = 0; i < nr; i++) obuf[i] = a2e[ibuf[i]];
+        else
+            memcpy(obuf, ibuf, (size_t)nr);
+        if (pax_write(fd, obuf, (size_t)nr, enc) != nr) { rc = -1; break; }
+        remaining -= nr;
         written += nr;
     }
+    if (rc == 0 && remaining > 0) {
+        /* file shrank mid-transfer: pad so the archive stays valid */
+        fprintf(stderr, "z-scp: warning: %s shrank during upload, padding\n", path);
+        unsigned char zero[8192] = {0};
+        while (remaining > 0) {
+            size_t chunk = (remaining < (off_t)sizeof(zero)) ? (size_t)remaining : sizeof(zero);
+            if (pax_write(fd, zero, chunk, enc) != (ssize_t)chunk) { rc = -1; break; }
+            remaining -= chunk;
+            written += chunk;
+        }
+        if (rc == 0) rc = -1; /* signal shortfall even though stream is intact */
+    }
+    /* Ignore trailing growth beyond the header size: already truncated by
+     * construction (we read at most filesize bytes). */
     close(src);
 
-    size_t pad = (512 - (written % 512)) % 512;
+    size_t pad = (512 - ((size_t)(written % 512))) % 512;
     if (pad && write_zeros(fd, pad) != 0) return -1;
 
-    return 0;
+    return rc;
 }
 
 /* =========================================================================
@@ -1009,17 +1292,22 @@ static char meta_path[4096];   /* resolved meta file path */
 
 #define PAX_BLOCK 512
 
+/* Read one 512-byte block, undoing the AUTOCVT transport conversion.
+ * z/OS SSH applies e2a[] to stdout bytes at the boundary (confirmed with
+ * `... | ssh host od -x`: ASCII 0x31 arrives as EBCDIC 0xF1), so a2e[]
+ * recovers the original on-disk bytes.  Block-oriented fread, not fgetc.
+ * NOTE: transfers unconditionally assume AUTOCVT=ON (remote commands set
+ * _BPXK_AUTOCVT=ON explicitly); the host probe is diagnostic only and
+ * never switches this codec, so a mis-probe cannot corrupt transfers. */
 static int pipe_read_block(FILE *pipe, unsigned char buf[PAX_BLOCK]) {
-    for (int i = 0; i < PAX_BLOCK; i++) {
-        int c = fgetc(pipe);
-        if (c == EOF) return -1;
-        buf[i] = a2e[(unsigned char)c];
+    size_t got = 0;
+    while (got < PAX_BLOCK) {
+        size_t n = fread(buf + got, 1, PAX_BLOCK - got, pipe);
+        if (n == 0) return -1;
+        got += n;
     }
+    for (int i = 0; i < PAX_BLOCK; i++) buf[i] = a2e[buf[i]];
     return 0;
-}
-
-static int pipe_read_block_raw(FILE *pipe, unsigned char buf[PAX_BLOCK]) {
-    return pipe_read_block(pipe, buf);
 }
 
 /* Parse ASCII octal field */
@@ -1117,7 +1405,10 @@ static void parse_xhdr_fields(const char *data, size_t len,
  */
 static void makedirs(const char *path) {
     char tmp[4096];
-    snprintf(tmp, sizeof(tmp), "%s", path);
+    if (snprintf(tmp, sizeof(tmp), "%s", path) >= (int)sizeof(tmp)) {
+        fprintf(stderr, "z-scp: path too long, skipping mkdir: %s\n", path);
+        return;
+    }
     for (char *p = tmp + 1; *p; p++) {
         if (*p == '/') {
             *p = '\0';
@@ -1142,6 +1433,12 @@ static void smart_convert(const char *out_path) {
     long fsz = ftell(f);
     rewind(f);
     if (fsz <= 0) { fclose(f); return; }
+    if (fsz > (long)SMART_MAX_BYTES) {
+        fprintf(stderr, "z-scp: --smart: %s too large (%ld bytes), skipping\n",
+                out_path, fsz);
+        fclose(f);
+        return;
+    }
     unsigned char *buf = malloc((size_t)fsz);
     if (!buf) { fclose(f); return; }
     if ((long)fread(buf, 1, (size_t)fsz, f) != fsz) { fclose(f); free(buf); return; }
@@ -1151,6 +1448,53 @@ static void smart_convert(const char *out_path) {
     if (f) { fwrite(buf, 1, (size_t)fsz, f); fclose(f); }
     free(buf);
     fprintf(stderr, "z-scp: smart-converted %s (detected 1047 → 819)\n", out_path);
+}
+
+/* Reject archive member names that would escape the destination:
+ * absolute paths and any '..' component.  Returns 1 if safe. */
+static int rel_is_safe(const char *rel) {
+    if (!rel || !*rel) return 0;
+    if (rel[0] == '/') return 0;
+    const char *p = rel;
+    while (*p) {
+        const char *slash = strchr(p, '/');
+        size_t len = slash ? (size_t)(slash - p) : strlen(p);
+        if (len == 2 && p[0] == '.' && p[1] == '.') return 0;
+        if (!slash) break;
+        p = slash + 1;
+    }
+    return 1;
+}
+
+/* Reconstruct a ustar member name honouring the prefix field (offset 345,
+ * 155 bytes) for names longer than 100 chars: "prefix/name". */
+static void ustar_name(const unsigned char block[PAX_BLOCK],
+                       char *out, size_t outsz) {
+    char name[101], prefix[156];
+    memcpy(name, block, 100); name[100] = '\0';
+    memcpy(prefix, block + 345, 155); prefix[155] = '\0';
+    if (prefix[0])
+        snprintf(out, outsz, "%s/%s", prefix, name);
+    else
+        snprintf(out, outsz, "%s", name);
+}
+
+/* Apply the archived mode/mtime to a just-written file.  chmod bypasses
+ * the umask (open used 0666); utimensat sets atime=mtime=archived mtime. */
+static void apply_file_attrs(const char *path, mode_t mode, time_t mtime) {
+    if (mode) {
+        if (chmod(path, mode & 07777) != 0)
+            fprintf(stderr, "z-scp: warning: chmod %s: %s\n",
+                    path, strerror(errno));
+    }
+    if (mtime) {
+        struct timespec ts[2];
+        ts[0].tv_sec = ts[1].tv_sec = mtime;
+        ts[0].tv_nsec = ts[1].tv_nsec = 0;
+        if (utimensat(AT_FDCWD, path, ts, 0) != 0)
+            fprintf(stderr, "z-scp: warning: utime %s: %s\n",
+                    path, strerror(errno));
+    }
 }
 
 /*
@@ -1166,8 +1510,19 @@ static int pax_extract_entry(FILE *pipe, const char *out_path,
                               mode_t ustar_mode, time_t ustar_mtime) {
     int effective_ccsid = force_ccsid ? force_ccsid : xs->ccsid;
 
+    if (sz < 0) {
+        fprintf(stderr, "z-scp: invalid size %lld for %s\n", sz, out_path);
+        return -1;
+    }
+
     char parent[4096];
-    snprintf(parent, sizeof(parent), "%s", out_path);
+    if (snprintf(parent, sizeof(parent), "%s", out_path) >= (int)sizeof(parent)) {
+        fprintf(stderr, "z-scp: path too long: %s\n", out_path);
+        long long skip = (sz + PAX_BLOCK - 1) / PAX_BLOCK;
+        unsigned char tmp[PAX_BLOCK];
+        for (long long b = 0; b < skip; b++) pipe_read_block(pipe, tmp);
+        return -1;
+    }
     char *slash = strrchr(parent, '/');
     if (slash && slash != parent) { *slash = '\0'; makedirs(parent); }
 
@@ -1176,7 +1531,7 @@ static int pax_extract_entry(FILE *pipe, const char *out_path,
         fprintf(stderr, "z-scp: open %s: %s\n", out_path, strerror(errno));
         long long skip = (sz + PAX_BLOCK - 1) / PAX_BLOCK;
         unsigned char tmp[PAX_BLOCK];
-        for (long long b = 0; b < skip; b++) pipe_read_block_raw(pipe, tmp);
+        for (long long b = 0; b < skip; b++) pipe_read_block(pipe, tmp);
         return -1;
     }
 
@@ -1192,14 +1547,24 @@ static int pax_extract_entry(FILE *pipe, const char *out_path,
         } else {
             memcpy(outbuf, block, take);
         }
-        if (write(out, outbuf, take) != (ssize_t)take) { close(out); return -1; }
+        if (write(out, outbuf, take) != (ssize_t)take) {
+            fprintf(stderr, "z-scp: write %s: %s\n", out_path, strerror(errno));
+            close(out);
+            /* drain the rest so the stream stays in sync */
+            while (remaining > 0) {
+                if (pipe_read_block(pipe, block) != 0) break;
+                remaining -= remaining < PAX_BLOCK ? remaining : PAX_BLOCK;
+            }
+            return -1;
+        }
         remaining -= take;
     }
     close(out);
+    apply_file_attrs(out_path, ustar_mode, ustar_mtime);
 
-    fprintf(stderr, "z-scp: extracted %s (ccsid=%d tag=%s)\n",
+    fprintf(stderr, "z-scp: extracted %s (ccsid=%d tag=%s mode=%04o)\n",
             out_path, effective_ccsid ? effective_ccsid : 65535,
-            xs->tag_on ? "on" : "off");
+            xs->tag_on ? "on" : "off", (unsigned)(ustar_mode & 07777));
 
     if (smart && xs->ccsid == 0 && !force_ccsid)
         smart_convert(out_path);
@@ -1207,7 +1572,10 @@ static int pax_extract_entry(FILE *pipe, const char *out_path,
     /* record metadata */
     if (meta_db && rel_path) {
         meta_entry_t *me = meta_db_add(meta_db);
-        snprintf(me->rel_path, sizeof(me->rel_path), "%s", rel_path);
+        if (!me) return -1;
+        if (snprintf(me->rel_path, sizeof(me->rel_path), "%s", rel_path)
+                >= (int)sizeof(me->rel_path))
+            fprintf(stderr, "z-scp: warning: rel path truncated: %s\n", rel_path);
         me->ccsid  = effective_ccsid ? effective_ccsid : xs->ccsid;
         me->tag_on = xs->tag_on;
         me->mode   = ustar_mode ? ustar_mode : 0644;
@@ -1218,6 +1586,22 @@ static int pax_extract_entry(FILE *pipe, const char *out_path,
     }
 
     return 0;
+}
+
+/* Strip a remote_root prefix ("u/proj" or "/u/proj") from an archive member
+ * path, returning the path relative to the transfer root. */
+static const char *strip_root(const char *rel, const char *remote_root) {
+    if (remote_root) {
+        const char *rr = remote_root;
+        while (*rr == '/') rr++;
+        size_t rrlen = strlen(rr);
+        if (rrlen > 0 && strncmp(rel, rr, rrlen) == 0
+                && (rel[rrlen] == '/' || rel[rrlen] == '\0')) {
+            rel += rrlen;
+            while (*rel == '/') rel++;
+        }
+    }
+    return rel;
 }
 
 /*
@@ -1234,7 +1618,7 @@ static int read_pax_stream(FILE *pipe, const char *dest_path,
     unsigned char block[PAX_BLOCK];
     xhdr_state_t xs;
     xhdr_state_reset(&xs);
-    int nfiles = 0;
+    int nfiles = 0, nerrors = 0;
 
     while (1) {
         if (pipe_read_block(pipe, block) != 0) break;
@@ -1247,19 +1631,28 @@ static int read_pax_stream(FILE *pipe, const char *dest_path,
         long long sz  = parse_octal((char *)block + 124, 12);
         mode_t   umode = (mode_t)parse_octal((char *)block + 100, 8);
         time_t   umtime = (time_t)parse_octal((char *)block + 136, 12);
+        if (sz < 0) {
+            fprintf(stderr, "z-scp: corrupt pax header (negative size), aborting\n");
+            return -1;
+        }
 
         if (type == 'g' || type == 'G' || type == 'x' || type == 'X') {
             long long xsz = sz;
+            if (xsz > (long long)XHDR_MAX_BYTES) {
+                fprintf(stderr, "z-scp: xhdr too large (%lld bytes), aborting\n", xsz);
+                return -1;
+            }
             char *xdata = malloc(xsz + 1);
             if (!xdata) return -1;
-            size_t got = 0;
-            while ((long long)got < xsz) {
-                if (pipe_read_block(pipe, block) != 0) { free(xdata); return -1; }
-                size_t take = ((long long)(xsz - got) < PAX_BLOCK)
-                              ? (size_t)(xsz - got) : PAX_BLOCK;
-                memcpy(xdata + got, block, take);
-                got += PAX_BLOCK;
+            long long got = 0;
+            int xerr = 0;
+            while (got < xsz) {
+                if (pipe_read_block(pipe, block) != 0) { xerr = 1; break; }
+                long long take = (xsz - got < PAX_BLOCK) ? (xsz - got) : PAX_BLOCK;
+                memcpy(xdata + got, block, (size_t)take);
+                got += take;
             }
+            if (xerr) { free(xdata); return -1; }
             xdata[xsz] = '\0';
             int is_global = (type == 'g' || type == 'G');
             parse_xhdr_fields(xdata, (size_t)xsz, &xs, is_global);
@@ -1272,67 +1665,101 @@ static int read_pax_stream(FILE *pipe, const char *dest_path,
             char rel_path[4096] = {0};
 
             if (dest_path) {
-                snprintf(out_path, sizeof(out_path), "%s", dest_path);
+                if (snprintf(out_path, sizeof(out_path), "%s", dest_path)
+                        >= (int)sizeof(out_path)) {
+                    fprintf(stderr, "z-scp: path too long: %s\n", dest_path);
+                    return -1;
+                }
                 /* rel_path for single-file: just the basename */
                 const char *bn = strrchr(dest_path, '/');
                 snprintf(rel_path, sizeof(rel_path), "%s", bn ? bn + 1 : dest_path);
             } else {
-                char arcname[101];
-                memcpy(arcname, block, 100);
-                arcname[100] = '\0';
-                const char *rel = arcname;
+                char fullname[512];
+                ustar_name(block, fullname, sizeof(fullname));
+                const char *rel = fullname;
                 while (*rel == '/') rel++;
                 /* strip remote_root prefix to get the relative path */
-                if (remote_root) {
-                    const char *rr = remote_root;
-                    while (*rr == '/') rr++;
-                    size_t rrlen = strlen(rr);
-                    if (rrlen > 0 && strncmp(rel, rr, rrlen) == 0
-                            && (rel[rrlen] == '/' || rel[rrlen] == '\0')) {
-                        rel += rrlen;
-                        while (*rel == '/') rel++;
-                    }
+                rel = strip_root(rel, remote_root);
+                if (!rel_is_safe(rel)) {
+                    fprintf(stderr, "z-scp: refusing unsafe member '%s'\n", fullname);
+                    long long skip = (sz + PAX_BLOCK - 1) / PAX_BLOCK;
+                    for (long long b = 0; b < skip; b++)
+                        if (pipe_read_block(pipe, block) != 0) return -1;
+                    xhdr_state_reset(&xs);
+                    nerrors++;
+                    continue;
                 }
-                snprintf(rel_path, sizeof(rel_path), "%s", rel);
-                snprintf(out_path, sizeof(out_path), "%s/%s", root_dir, rel);
+                if (snprintf(rel_path, sizeof(rel_path), "%s", rel)
+                        >= (int)sizeof(rel_path)
+                        || snprintf(out_path, sizeof(out_path), "%s/%s", root_dir, rel)
+                        >= (int)sizeof(out_path)) {
+                    fprintf(stderr, "z-scp: path too long, skipping '%s'\n", rel);
+                    long long skip = (sz + PAX_BLOCK - 1) / PAX_BLOCK;
+                    for (long long b = 0; b < skip; b++)
+                        if (pipe_read_block(pipe, block) != 0) return -1;
+                    xhdr_state_reset(&xs);
+                    nerrors++;
+                    continue;
+                }
             }
 
-            if (pax_extract_entry(pipe, out_path, sz, &xs,
+            int rc = pax_extract_entry(pipe, out_path, sz, &xs,
                                   meta_db, rel_path[0] ? rel_path : NULL,
-                                  umode, umtime) == 0)
+                                  umode, umtime);
+            if (rc == 0)
                 nfiles++;
-            else
-                nfiles++;
+            else {
+                nerrors++;
+                if (dest_path) return -1;
+            }
 
             xhdr_state_reset(&xs);
-            if (dest_path) return 0;
+            if (dest_path) return rc;
             continue;
         }
 
         if (type == '5') {
             if (!dest_path) {
-                char arcname[101];
-                memcpy(arcname, block, 100);
-                arcname[100] = '\0';
-                const char *rel = arcname;
+                char fullname[512];
+                ustar_name(block, fullname, sizeof(fullname));
+                const char *rel = fullname;
                 while (*rel == '/') rel++;
-                char dir_path[4096];
-                snprintf(dir_path, sizeof(dir_path), "%s/%s", root_dir, rel);
-                makedirs(dir_path);
+                rel = strip_root(rel, remote_root);
+                if (*rel == '\0') {
+                    /* the transfer root itself — just ensure it exists */
+                    makedirs(root_dir);
+                } else if (!rel_is_safe(rel)) {
+                    fprintf(stderr, "z-scp: refusing unsafe dir '%s'\n", fullname);
+                } else {
+                    char dir_path[4096];
+                    if (snprintf(dir_path, sizeof(dir_path), "%s/%s", root_dir, rel)
+                            >= (int)sizeof(dir_path)) {
+                        fprintf(stderr, "z-scp: dir path too long: '%s'\n", rel);
+                    } else {
+                        makedirs(dir_path);
+                        if (umode) chmod(dir_path, umode & 07777);
+                    }
+                }
             }
             xhdr_state_reset(&xs);
             continue;
         }
 
         /* Skip other entry types */
+        if (sz < 0) return -1;
         long long nblocks = (sz + PAX_BLOCK - 1) / PAX_BLOCK;
         for (long long b = 0; b < nblocks; b++)
             if (pipe_read_block(pipe, block) != 0) return nfiles > 0 ? 0 : -1;
         xhdr_state_reset(&xs);
     }
 
-    if (nfiles == 0 && dest_path) {
-        fprintf(stderr, "z-scp: no regular file found in pax stream\n");
+    if (nfiles == 0) {
+        if (dest_path)
+            fprintf(stderr, "z-scp: no regular file found in pax stream\n");
+        return -1;
+    }
+    if (nerrors) {
+        fprintf(stderr, "z-scp: %d file(s) failed\n", nerrors);
         return -1;
     }
     return 0;
@@ -1342,18 +1769,23 @@ static int read_pax_stream(FILE *pipe, const char *dest_path,
  * Argument parsing and SSH dispatch
  * ====================================================================== */
 
+/* Split user@host:/path.  Like scp, a bare colon is not enough: the part
+ * before the first ':' must not contain '/' (so local files such as
+ * /tmp/a:b or ./log:2024 are never mistaken for remote specs). */
 static int split_remote(const char *arg, char *host, size_t hostsz,
                         char *path, size_t pathsz) {
     const char *colon = strchr(arg, ':');
     if (!colon) return 0;
-    size_t hlen = colon - arg;
+    size_t hlen = (size_t)(colon - arg);
     if (hlen == 0 || hlen >= hostsz) return 0;
+    for (size_t i = 0; i < hlen; i++)
+        if (arg[i] == '/') return 0;
     memcpy(host, arg, hlen); host[hlen] = '\0';
-    strncpy(path, colon + 1, pathsz - 1); path[pathsz - 1] = '\0';
+    if (snprintf(path, pathsz, "%s", colon + 1) >= (int)pathsz) return 0;
+    if (!path[0]) return 0;
     return 1;
 }
 
-__attribute__((unused))
 static const char *basename_of(const char *path) {
     const char *p = strrchr(path, '/');
     return p ? p + 1 : path;
@@ -1364,12 +1796,21 @@ static const char *basename_of(const char *path) {
  * ====================================================================== */
 
 typedef struct { char **paths; size_t n, cap; } strlist_t;
-static void sl_add(strlist_t *l, char *s) {
-    if (l->n == l->cap) {
-        l->cap = l->cap ? l->cap * 2 : 64;
-        l->paths = realloc(l->paths, l->cap * sizeof(*l->paths));
+/* Queue a (local, remote, rel) triple atomically: either all three are
+ * queued (ownership transferred) or none are.  Returns 0 ok, -1 on OOM. */
+static int sl_add3(strlist_t *l, char *a, char *b, char *c) {
+    if (l->n + 3 > l->cap) {
+        size_t ncap = l->cap ? l->cap * 2 : 64;
+        while (ncap < l->n + 3) ncap *= 2;
+        char **nn = realloc(l->paths, ncap * sizeof(*l->paths));
+        if (!nn) return -1;
+        l->paths = nn;
+        l->cap = ncap;
     }
-    l->paths[l->n++] = s;
+    l->paths[l->n++] = a;
+    l->paths[l->n++] = b;
+    l->paths[l->n++] = c;
+    return 0;
 }
 
 /*
@@ -1382,33 +1823,40 @@ static void sl_add(strlist_t *l, char *s) {
 static int upload_one_file(int fd, const char *local_path,
                            const char *remote_path, const char *rel_path,
                            const struct stat *st, meta_db_t *meta_db) {
-    int ccsid, tag_on;
-    mode_t  mode  = st->st_mode;
+    int ccsid, tag_on, to_ebcdic;
+    mode_t  mode  = st->st_mode & 07777;
     time_t  mtime = st->st_mtime;
     const meta_entry_t *me = meta_db ? meta_db_find(meta_db, rel_path) : NULL;
 
     if (me) {
+        /* Meta wins outright (writer always stores mode+mtime, so apply
+         * even when they are 0 — 0000/epoch are representable states). */
         ccsid  = me->ccsid;
         tag_on = me->tag_on;
-        if (me->mode)  mode  = me->mode;
-        if (me->mtime) mtime = me->mtime;
+        mode   = me->mode & 07777;
+        mtime  = me->mtime;
+        /* Local holds ASCII after our download conversion; a meta 1047
+         * means "convert back to EBCDIC for storage". */
+        to_ebcdic = (me->ccsid == 1047);
     } else {
         /* auto-detect */
         int is_text = 0;
         ccsid = detect_ccsid(local_path, &is_text);
         if (ccsid < 0) return -1;
         tag_on = (ccsid != 65535) ? 1 : 0;
-        /* normalise: always tag as 819 unless the meta says 1047 */
+        /* normalise: always tag as 819 unless content scores EBCDIC */
         if (ccsid == 1047) {
-            /* local file was converted to ASCII on download; keep ccsid=1047
-             * so we convert back to EBCDIC and tag 1047 on remote */
-        } else if (ccsid != 65535) {
-            ccsid = 819;
+            /* Local bytes already look like EBCDIC and there is no meta
+             * proving they are post-conversion ASCII: pass through as-is
+             * under the 1047 tag (no double conversion). */
+            to_ebcdic = 0;
+        } else {
+            if (ccsid != 65535) ccsid = 819;
+            to_ebcdic = 0;
         }
     }
 
-    const char *basename = strrchr(remote_path, '/');
-    basename = basename ? basename + 1 : remote_path;
+    const char *basename = basename_of(remote_path);
 
     fprintf(stderr, "z-scp: %s → %s (ccsid=%d tag=%s%s)\n",
             local_path, remote_path, ccsid, tag_on ? "on" : "off",
@@ -1429,8 +1877,8 @@ static int upload_one_file(int fd, const char *local_path,
 
     if (write_pax_xhdr(fd, basename, xhdr_ccsid, tag_on,
                        PAX_EBCDIC, mode, mtime) != 0 ||
-        write_pax_file(fd, local_path, remote_path, ccsid,
-                       st->st_size, PAX_EBCDIC, mode, mtime) != 0)
+        write_pax_file(fd, local_path, remote_path, to_ebcdic,
+                       PAX_EBCDIC, mode, mtime) != 0)
         return -1;
 
     return 0;
@@ -1457,35 +1905,66 @@ static int write_pax_tree(int fd, const char *local_dir,
     while ((ent = readdir(d)) != NULL) {
         if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
             continue;
-        /* skip the meta file itself — don't upload it to z/OS */
-        if (use_meta && meta_path[0]) {
-            /* compare basename of meta_path with ent->d_name */
-            const char *mb = strrchr(meta_path, '/');
-            mb = mb ? mb + 1 : meta_path;
+        /* skip the meta file itself — don't upload it to z/OS.
+         * Only at the top level (rel_prefix==""): deeper files that merely
+         * share the basename are real payload. */
+        if (use_meta && meta_path[0] && rel_prefix[0] == '\0') {
+            const char *mb = basename_of(meta_path);
             if (strcmp(ent->d_name, mb) == 0) continue;
         }
 
         char local_path[4096], remote_path[4096], rel_path[4096];
-        snprintf(local_path,  sizeof(local_path),  "%s/%s", local_dir,  ent->d_name);
-        snprintf(remote_path, sizeof(remote_path), "%s/%s", remote_dir, ent->d_name);
-        if (rel_prefix[0])
-            snprintf(rel_path, sizeof(rel_path), "%s/%s", rel_prefix, ent->d_name);
-        else
-            snprintf(rel_path, sizeof(rel_path), "%s", ent->d_name);
+        if (snprintf(local_path,  sizeof(local_path),  "%s/%s", local_dir,  ent->d_name)
+                >= (int)sizeof(local_path)
+                || snprintf(remote_path, sizeof(remote_path), "%s/%s", remote_dir, ent->d_name)
+                >= (int)sizeof(remote_path)) {
+            fprintf(stderr, "z-scp: path too long, skipping %s/%s\n", local_dir, ent->d_name);
+            errors++;
+            continue;
+        }
+        if (rel_prefix[0]) {
+            if (snprintf(rel_path, sizeof(rel_path), "%s/%s", rel_prefix, ent->d_name)
+                    >= (int)sizeof(rel_path)) {
+                fprintf(stderr, "z-scp: rel path too long, skipping %s\n", ent->d_name);
+                errors++;
+                continue;
+            }
+        } else {
+            if (snprintf(rel_path, sizeof(rel_path), "%s", ent->d_name)
+                    >= (int)sizeof(rel_path)) {
+                fprintf(stderr, "z-scp: rel path too long, skipping %s\n", ent->d_name);
+                errors++;
+                continue;
+            }
+        }
 
         struct stat st;
         if (lstat(local_path, &st) != 0) {
             fprintf(stderr, "z-scp: lstat %s: %s\n", local_path, strerror(errno));
+            errors++;
             continue;
         }
 
         if (S_ISDIR(st.st_mode)) {
-            sl_add(&subdirs, strdup(local_path));
-            sl_add(&subdirs, strdup(remote_path));
-            sl_add(&subdirs, strdup(rel_path));
+            char *a = strdup(local_path), *b = strdup(remote_path), *c = strdup(rel_path);
+            if (!a || !b || !c) {
+                fprintf(stderr, "z-scp: out of memory\n");
+                free(a); free(b); free(c);
+                errors++;
+                continue;
+            }
+            if (sl_add3(&subdirs, a, b, c) != 0) {
+                fprintf(stderr, "z-scp: out of memory\n");
+                free(a); free(b); free(c);
+                errors++;
+                continue;
+            }
             continue;
         }
-        if (!S_ISREG(st.st_mode)) continue;
+        if (!S_ISREG(st.st_mode)) {
+            fprintf(stderr, "z-scp: skipping non-regular file %s\n", local_path);
+            continue;
+        }
 
         if (upload_one_file(fd, local_path, remote_path, rel_path,
                             &st, meta_db) != 0)
@@ -1506,37 +1985,55 @@ static int write_pax_tree(int fd, const char *local_dir,
 
 static int upload_dir(const char *local_dir, const char *remote_host,
                       const char *remote_dir, meta_db_t *meta_db) {
-    if (dry_run)
-        return write_pax_tree(-1, local_dir, remote_dir, "", meta_db);
+    if (dry_run) {
+        int e = write_pax_tree(-1, local_dir, remote_dir, "", meta_db);
+        return e ? 1 : 0;
+    }
 
-    char ssh_cmd[4096];
-    snprintf(ssh_cmd, sizeof(ssh_cmd),
-             "ssh -o BatchMode=yes %s \"/bin/pax -r -x pax -p p\"",
-             remote_host);
+    /* No user input in this remote command; AUTOCVT is requested
+     * explicitly so the transfer never depends on the server default. */
+    static const char remote_cmd[] =
+        "_BPXK_AUTOCVT=ON /bin/pax -r -x pax -p p";
 
     fprintf(stderr, "z-scp: streaming pax archive to %s:%s...\n",
             remote_host, remote_dir);
 
-    FILE *pipe = popen(ssh_cmd, "w");
+    pid_t pid = -1;
+    FILE *pipe = ssh_spawn(remote_host, remote_cmd, 'w', &pid);
     if (!pipe) {
-        fprintf(stderr, "z-scp: popen ssh: %s\n", strerror(errno));
+        fprintf(stderr, "z-scp: ssh spawn failed\n");
         return 1;
     }
 
     int fd = fileno(pipe);
     int errors = write_pax_tree(fd, local_dir, remote_dir, "", meta_db);
 
+    /* End-of-archive: two zero blocks (invariant under AUTOCVT). */
     unsigned char eoa[1024] = {0};
     if (write(fd, eoa, sizeof(eoa)) != sizeof(eoa)) errors++;
 
-    int rc = pclose(pipe);
-    if (rc != 0) {
-        fprintf(stderr, "z-scp: pax -r failed (exit %d)\n", WEXITSTATUS(rc));
+    int status = ssh_wait(pipe, pid);
+    if (status != 0) {
+        if (WIFEXITED(status))
+            fprintf(stderr, "z-scp: pax -r failed (exit %d)\n", WEXITSTATUS(status));
+        else
+            fprintf(stderr, "z-scp: pax -r failed (status %d)\n", status);
         errors++;
     }
 
-    fprintf(stderr, "z-scp: recursive upload complete\n");
+    if (!errors) fprintf(stderr, "z-scp: recursive upload complete\n");
     return errors ? 1 : 0;
+}
+
+/* Build "_BPXK_AUTOCVT=ON /bin/pax -w -x pax '<path>'" with the path
+ * safely quoted for the remote shell.  Returns 0 ok, -1 on truncation. */
+static int build_pax_read_cmd(char *out, size_t outsz, const char *remote_path) {
+    const char prefix[] = "_BPXK_AUTOCVT=ON /bin/pax -w -x pax ";
+    size_t off = 0;
+    if (strlen(prefix) + 1 >= outsz) return -1;
+    memcpy(out, prefix, sizeof(prefix)); /* includes NUL */
+    off = sizeof(prefix) - 1;
+    return ssh_quote_append(out, outsz, &off, remote_path);
 }
 
 /* =========================================================================
@@ -1551,24 +2048,34 @@ static int download_dir(const char *remote_host, const char *remote_dir,
         return 0;
     }
 
-    char pax_cmd[4096];
-    snprintf(pax_cmd, sizeof(pax_cmd),
-             "ssh -o BatchMode=yes %s \"/bin/pax -w -x pax '%s'\"",
-             remote_host, remote_dir);
+    char remote_cmd[4096];
+    if (build_pax_read_cmd(remote_cmd, sizeof(remote_cmd), remote_dir) != 0) {
+        fprintf(stderr, "z-scp: remote path too long\n");
+        return 1;
+    }
 
     fprintf(stderr, "z-scp: streaming pax from %s:%s...\n", remote_host, remote_dir);
-    FILE *pipe = popen(pax_cmd, "r");
+    pid_t pid = -1;
+    FILE *pipe = ssh_spawn(remote_host, remote_cmd, 'r', &pid);
     if (!pipe) {
-        fprintf(stderr, "z-scp: popen ssh: %s\n", strerror(errno));
+        fprintf(stderr, "z-scp: ssh spawn failed\n");
         return 1;
     }
 
     makedirs(local_dir);
     int rc = read_pax_stream(pipe, NULL, local_dir, remote_dir, meta_db);
-    pclose(pipe);
+    int status = ssh_wait(pipe, pid);
+    if (status != 0) {
+        if (WIFEXITED(status))
+            fprintf(stderr, "z-scp: remote pax -w failed (exit %d)\n",
+                    WEXITSTATUS(status));
+        else
+            fprintf(stderr, "z-scp: remote pax -w failed (status %d)\n", status);
+        rc = 1;
+    }
 
-    fprintf(stderr, "z-scp: recursive download complete\n");
-    return rc;
+    if (!rc) fprintf(stderr, "z-scp: recursive download complete\n");
+    return rc ? 1 : 0;
 }
 
 /* =========================================================================
@@ -1583,26 +2090,28 @@ static int do_upload(const char *local, const char *remote_host,
         return 1;
     }
 
-    /* rel_path for a single file: just the filename */
-    const char *bn = strrchr(local, '/');
-    const char *rel_path = bn ? bn + 1 : local;
-
-    if (dry_run) {
-        fprintf(stderr, "z-scp: dry-run: upload %s → %s:%s\n",
-                local, remote_host, remote_path);
-        return 0;
-    }
+    /* rel_path for a single file: the local basename.  This matches the
+     * download side (which keys on the local basename too), so a
+     * download-then-upload round-trip finds its meta entry even when the
+     * remote and local basenames differ. */
+    const char *rel_path = basename_of(local);
 
     fprintf(stderr, "z-scp: upload %s → %s:%s\n", local, remote_host, remote_path);
 
-    char ssh_cmd[4096];
-    snprintf(ssh_cmd, sizeof(ssh_cmd),
-             "ssh -o BatchMode=yes %s \"/bin/pax -r -x pax -p p\"",
-             remote_host);
+    if (dry_run) {
+        /* Reuse the classifier so dry-run shows the ccsid/tag decision
+         * (fd is unused: upload_one_file returns before writing). */
+        upload_one_file(-1, local, remote_path, rel_path, &st, meta_db);
+        return 0;
+    }
 
-    FILE *pipe = popen(ssh_cmd, "w");
+    static const char remote_cmd[] =
+        "_BPXK_AUTOCVT=ON /bin/pax -r -x pax -p p";
+
+    pid_t pid = -1;
+    FILE *pipe = ssh_spawn(remote_host, remote_cmd, 'w', &pid);
     if (!pipe) {
-        fprintf(stderr, "z-scp: popen ssh: %s\n", strerror(errno));
+        fprintf(stderr, "z-scp: ssh spawn failed\n");
         return 1;
     }
 
@@ -1611,12 +2120,16 @@ static int do_upload(const char *local, const char *remote_host,
     if (upload_one_file(fd, local, remote_path, rel_path, &st, meta_db) != 0)
         rc = 1;
 
+    /* End-of-archive: two zero blocks (invariant under AUTOCVT). */
     unsigned char eoa[1024] = {0};
     if (write(fd, eoa, sizeof(eoa)) != sizeof(eoa)) rc = 1;
 
-    int prc = pclose(pipe);
-    if (prc != 0) {
-        fprintf(stderr, "z-scp: pax -r failed (exit %d)\n", WEXITSTATUS(prc));
+    int status = ssh_wait(pipe, pid);
+    if (status != 0) {
+        if (WIFEXITED(status))
+            fprintf(stderr, "z-scp: pax -r failed (exit %d)\n", WEXITSTATUS(status));
+        else
+            fprintf(stderr, "z-scp: pax -r failed (status %d)\n", status);
         rc = 1;
     }
 
@@ -1624,11 +2137,20 @@ static int do_upload(const char *local, const char *remote_host,
 
     if (!rc && do_verify) {
         char od_cmd[4096];
-        snprintf(od_cmd, sizeof(od_cmd),
-                 "ssh -o BatchMode=yes %s \"/bin/od -An -tx1 -N32 '%s'\"",
-                 remote_host, remote_path);
-        fprintf(stderr, "z-scp: verify — remote first 32 bytes (hex):\n");
-        int _r = system(od_cmd); (void)_r;
+        const char od_prefix[] = "_BPXK_AUTOCVT=ON /bin/od -An -tx1 -N32 ";
+        size_t off = 0;
+        if (strlen(od_prefix) + 1 < sizeof(od_cmd)) {
+            memcpy(od_cmd, od_prefix, sizeof(od_prefix));
+            off = sizeof(od_prefix) - 1;
+        }
+        if (ssh_quote_append(od_cmd, sizeof(od_cmd), &off, remote_path) != 0) {
+            fprintf(stderr, "z-scp: verify path too long, skipping\n");
+        } else {
+            fprintf(stderr, "z-scp: verify — remote first 32 bytes (hex):\n");
+            int vst = ssh_run_discard(remote_host, od_cmd);
+            if (vst != 0)
+                fprintf(stderr, "z-scp: verify od failed (status %d)\n", vst);
+        }
     }
 
     return rc;
@@ -1645,22 +2167,32 @@ static int do_download(const char *remote_host, const char *remote_path,
         return 0;
     }
 
-    char pax_cmd[4096];
-    snprintf(pax_cmd, sizeof(pax_cmd),
-             "ssh -o BatchMode=yes %s \"/bin/pax -w -x pax '%s'\"",
-             remote_host, remote_path);
+    char remote_cmd[4096];
+    if (build_pax_read_cmd(remote_cmd, sizeof(remote_cmd), remote_path) != 0) {
+        fprintf(stderr, "z-scp: remote path too long\n");
+        return 1;
+    }
 
-    FILE *pipe = popen(pax_cmd, "r");
+    pid_t pid = -1;
+    FILE *pipe = ssh_spawn(remote_host, remote_cmd, 'r', &pid);
     if (!pipe) {
-        fprintf(stderr, "z-scp: popen ssh: %s\n", strerror(errno));
+        fprintf(stderr, "z-scp: ssh spawn failed\n");
         return 1;
     }
 
     int rc = read_pax_stream(pipe, local, NULL, NULL, meta_db);
-    pclose(pipe);
+    int status = ssh_wait(pipe, pid);
+    if (status != 0) {
+        if (WIFEXITED(status))
+            fprintf(stderr, "z-scp: remote pax -w failed (exit %d)\n",
+                    WEXITSTATUS(status));
+        else
+            fprintf(stderr, "z-scp: remote pax -w failed (status %d)\n", status);
+        rc = 1;
+    }
 
     if (!rc) fprintf(stderr, "z-scp: download complete\n");
-    return rc;
+    return rc ? 1 : 0;
 }
 
 /* =========================================================================
@@ -1669,31 +2201,67 @@ static int do_download(const char *remote_host, const char *remote_path,
 
 int main(int argc, char **argv) {
     int meta_path_explicit = 0;   /* 1 if --meta-file was used */
+    const char *pos[2] = {0, 0};
+    int npos = 0;
 
-    while (argc > 1 && argv[1][0] == '-') {
-        if      (strcmp(argv[1], "-r")          == 0) recursive = 1;
-        else if (strcmp(argv[1], "--dry-run")   == 0) dry_run   = 1;
-        else if (strcmp(argv[1], "--reprobe")   == 0) reprobe   = 1;
-        else if (strcmp(argv[1], "--verify")    == 0) do_verify = 1;
-        else if (strcmp(argv[1], "--smart")     == 0) smart     = 1;
-        else if (strcmp(argv[1], "--meta")      == 0) use_meta  = 1;
-        else if (strcmp(argv[1], "--ccsid")     == 0) {
-            if (argc < 3) { fprintf(stderr, "z-scp: --ccsid requires a value\n"); return 1; }
-            force_ccsid = atoi(argv[2]);
-            argv++; argc--;
+    /* Never die with SIGPIPE when the remote pax exits early; writes then
+     * fail with EPIPE and surface as ordinary transfer errors. */
+    signal(SIGPIPE, SIG_IGN);
+
+    /* Options may appear before, between, or after the two paths
+     * (README shows trailing --meta).  Unknown flags are an error. */
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (strcmp(a, "--") == 0) {
+            for (int j = i + 1; j < argc; j++) {
+                if (npos >= 2) {
+                    fprintf(stderr, "z-scp: too many arguments\n");
+                    return 1;
+                }
+                pos[npos++] = argv[j];
+            }
+            break;
+        } else if (strcmp(a, "-r") == 0) recursive = 1;
+        else if (strcmp(a, "--dry-run")   == 0) dry_run   = 1;
+        else if (strcmp(a, "--reprobe")   == 0) reprobe   = 1;
+        else if (strcmp(a, "--verify")    == 0) do_verify = 1;
+        else if (strcmp(a, "--smart")     == 0) smart     = 1;
+        else if (strcmp(a, "--meta")      == 0) use_meta  = 1;
+        else if (strcmp(a, "--ccsid")     == 0) {
+            if (i + 1 >= argc) { fprintf(stderr, "z-scp: --ccsid requires a value\n"); return 1; }
+            char *end = NULL;
+            errno = 0;
+            long cv = strtol(argv[++i], &end, 10);
+            if (errno != 0 || end == argv[i] || *end != '\0' || cv <= 0 || cv > 65535) {
+                fprintf(stderr, "z-scp: invalid --ccsid '%s' (want 1..65535)\n", argv[i]);
+                return 1;
+            }
+            force_ccsid = (int)cv;
         }
-        else if (strcmp(argv[1], "--meta-file") == 0) {
-            if (argc < 3) { fprintf(stderr, "z-scp: --meta-file requires a filename\n"); return 1; }
+        else if (strcmp(a, "--meta-file") == 0) {
+            if (i + 1 >= argc) { fprintf(stderr, "z-scp: --meta-file requires a filename\n"); return 1; }
             use_meta = 1;
             meta_path_explicit = 1;
-            snprintf(meta_path, sizeof(meta_path), "%s", argv[2]);
-            argv++; argc--;
+            if (snprintf(meta_path, sizeof(meta_path), "%s", argv[++i])
+                    >= (int)sizeof(meta_path)) {
+                fprintf(stderr, "z-scp: --meta-file path too long\n");
+                return 1;
+            }
         }
-        else break;
-        argv++; argc--;
+        else if (a[0] == '-' && a[1] != '\0') {
+            fprintf(stderr, "z-scp: unknown option '%s'\n", a);
+            return 1;
+        }
+        else {
+            if (npos >= 2) {
+                fprintf(stderr, "z-scp: too many arguments\n");
+                return 1;
+            }
+            pos[npos++] = a;
+        }
     }
 
-    if (argc != 3) {
+    if (npos != 2) {
         fprintf(stderr,
                 "Usage: z-scp [options] <source> <destination>\n"
                 "  upload:   z-scp localfile       user@host:/remote/path\n"
@@ -1705,12 +2273,13 @@ int main(int argc, char **argv) {
                 "  --ccsid N       force CCSID N for download conversion\n"
                 "  --smart         auto-detect encoding for untagged downloads\n"
                 "  --meta          read/write .z-scp-meta.json alongside local files\n"
-                "  --meta-file F   read/write meta data to/from file F\n");
+                "  --meta-file F   read/write meta data to/from file F\n"
+                "  --reprobe       refresh cached PAX-header probe for the host\n");
         return 1;
     }
 
-    const char *src = argv[1];
-    const char *dst = argv[2];
+    const char *src = pos[0];
+    const char *dst = pos[1];
 
     char src_host[256], src_path[1024];
     char dst_host[256], dst_path[1024];
@@ -1732,6 +2301,18 @@ int main(int argc, char **argv) {
     int is_upload = !src_remote;
     /* local side is dst for download, src for upload */
     const char *local_side = is_upload ? src : dst;
+    const char *remote_host = is_upload ? dst_host : src_host;
+
+    /* Resolve (and cache) the host's pax-header encoding.  Diagnostic only:
+     * transfers pin PAX_EBCDIC with explicit _BPXK_AUTOCVT=ON, so a
+     * mis-probe can never corrupt data (see pipe_read_block). */
+    if (!dry_run) {
+        g_pax_enc = get_host_enc(remote_host, reprobe);
+        if (g_pax_enc != PAX_EBCDIC)
+            fprintf(stderr, "z-scp: warning: %s probed as ASCII pax headers; "
+                    "transfers still assume EBCDIC with AUTOCVT=ON\n",
+                    remote_host);
+    }
 
     /* resolve meta path if --meta (bare) was given */
     if (use_meta && !meta_path_explicit) {
@@ -1739,7 +2320,10 @@ int main(int argc, char **argv) {
         struct stat st;
         if (!is_upload && recursive) is_dir = 1;
         if ( is_upload && stat(local_side, &st) == 0 && S_ISDIR(st.st_mode)) is_dir = 1;
-        meta_default_path(meta_path, sizeof(meta_path), local_side, is_dir);
+        if (meta_default_path(meta_path, sizeof(meta_path), local_side, is_dir) != 0) {
+            fprintf(stderr, "z-scp: local path too long for meta default\n");
+            return 1;
+        }
     }
 
     /* load meta db for upload; allocate empty db for download */

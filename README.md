@@ -90,6 +90,7 @@ z-scp -r pok56:/home/user/myproject  ./myproject
 | `--ccsid N` | Force CCSID N for download conversion (e.g. `1047`) |
 | `--meta` | Read/write `.z-scp-meta.json` alongside the local files |
 | `--meta-file F` | Read/write meta data to/from the explicit file `F` |
+| `--reprobe` | Refresh the cached PAX-header probe for the host |
 
 ---
 
