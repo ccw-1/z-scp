@@ -463,28 +463,34 @@ static void cache_write(const char *host, pax_enc_t enc) {
  * ====================================================================== */
 
 /* Check magic bytes at offset 257 to determine PAX header encoding.
- * EBCDIC-1047: u=0xe4 s=0xa2 t=0xa3 a=0x81 r=0x99 */
+ * POSIX pax headers are ASCII "ustar" on disk.  On z/OS the session runs
+ * with _BPXK_AUTOCVT=ON, which applies e2a[] to stdout, so locally we
+ * observe e2a("ustar") = CD CB C8 2F CA.  Untranslated EBCDIC-1047
+ * (AUTOCVT off) would be A4 A2 A3 81 99 (lowercase u; E4 would be
+ * uppercase "Ustar").  Any EBCDIC form means PAX_EBCDIC (z/OS). */
 static pax_enc_t detect_magic(const unsigned char hdr[512]) {
     if (memcmp(hdr + 257, "ustar", 5) == 0) return PAX_ASCII;
-    static const unsigned char ebcdic_ustar[5] = {0xe4, 0xa2, 0xa3, 0x81, 0x99};
+    static const unsigned char ebcdic_ustar[5] = {0xa4, 0xa2, 0xa3, 0x81, 0x99};
     if (memcmp(hdr + 257, ebcdic_ustar, 5) == 0) return PAX_EBCDIC;
+    /* e2a("ustar"): ASCII headers as seen through AUTOCVT (the real z/OS
+     * probe result — verified against pok59). */
+    static const unsigned char xlated_ustar[5] = {0xcd, 0xcb, 0xc8, 0x2f, 0xca};
+    if (memcmp(hdr + 257, xlated_ustar, 5) == 0) return PAX_EBCDIC;
     return PAX_ASCII; /* unknown — default safe */
 }
 
 /* Ask remote host to produce a tiny PAX archive, inspect its magic field.
- * Uses a mktemp-created remote file (no predictable /tmp name) and no
- * local shell: host travels as a single ssh argv element.
+ * Read-only: archives the always-present /bin/sh, so no temp file, no
+ * mktemp (absent on z/OS), no cleanup and no predictable-/tmp race; and
+ * no local shell: host travels as a single ssh argv element.
+ * Uses _BPXK_AUTOCVT=ON to match the transfer path.
  * Returns PAX_ASCII/PAX_EBCDIC, or -1 when the probe itself failed
  * (caller falls back to EBCDIC without caching). */
 static int probe_host(const char *host) {
     fprintf(stderr, "z-scp: probing PAX header encoding for %s...\n", host);
 
     static const char remote_cmd[] =
-        "unset _BPXK_AUTOCVT; "
-        "T=$(/bin/mktemp /tmp/__zscp_probe_XXXXXX) || exit 1; "
-        "/bin/echo x>\"$T\" && "
-        "/bin/pax -w -x pax \"$T\"; rc=$?; "
-        "/bin/rm -f \"$T\"; exit $rc";
+        "_BPXK_AUTOCVT=ON /bin/pax -w -x pax /bin/sh";
 
     pid_t pid = -1;
     FILE *p = ssh_spawn(host, remote_cmd, 'r', &pid);
